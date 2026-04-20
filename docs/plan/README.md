@@ -15,6 +15,9 @@
 | [spec-04-mzm-no-dc-5hz](spec-04-mzm-no-dc-5hz.md) | **COMPLETE** ✅ | 5 Hz dual-scan, all-target no-DC control — validated 2026-04-13 |
 | [spec-05-robustness](spec-05-robustness.md) | Pending | Robustness, tuning interface, parameter persistence |
 | [spec-06-multi-modulator](spec-06-multi-modulator.md) | Future | DDMZM, DPMZM, DPQPSK, PM support |
+| [spec-06a-dpmzm-migration-checklist](spec-06a-dpmzm-migration-checklist.md) | Draft | DPMZM 改造清单：基于当前 MZM 工程真实代码结构的落地路线 |
+| [spec-06b-dpmzm-parallel-files](spec-06b-dpmzm-parallel-files.md) | Draft | DPMZM 并行新增文件清单：在不破坏原 MZM 主线前提下扩展 |
+| [spec-06c-dpmzm-first-batch-files](spec-06c-dpmzm-first-batch-files.md) | Draft | DPMZM 第一批创建文件清单：先做最小开环实验集合 |
 
 ## Key Technical Parameters
 
@@ -56,3 +59,8 @@ PD → TIA(OPA140) → ADS131M02 CH0 → Goertzel(f0, 2f0)
 - Raw CSV captures: `docs/scans/raw/`
 - Generated figures: `docs/scans/plots/`
 - Repository keeps only the current retained validation set; see `docs/scans/README.md`
+
+## DPMZM Working Notes
+
+- [spec-06d-dpmzm-status-overview](spec-06d-dpmzm-status-overview.md): DPMZM 总览页，集中说明目标、已实现、未实现、代码入口与下一步
+- [spec-06e-dpmzm-uart-checklist](spec-06e-dpmzm-uart-checklist.md): 明天上板实验时可直接照着执行的 DPMZM 串口命令清单

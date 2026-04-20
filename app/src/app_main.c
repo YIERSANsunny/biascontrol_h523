@@ -1,4 +1,7 @@
 #include "app_main.h"
+/* TEMP_DPMZM_BRIDGE: temporary include for DPMZM open-loop experiments.
+ * Remove this include after DPMZM gets its own dedicated app entry/target. */
+#include "app_main_dpmzm.h"
 #include "app_uart.h"
 #include "drv_board.h"
 #include "drv_dac8568.h"
@@ -1334,6 +1337,13 @@ void app_init(void)
     memset(&ctx, 0, sizeof(ctx));
     ctx.state = APP_STATE_INIT;
     ctx.tick_ms = 0;
+
+    /* TEMP_DPMZM_BRIDGE_BEGIN
+     * Temporary DPMZM initialization hook.
+     * Remove this line after the DPMZM path no longer depends on app_main.c.
+     */
+    app_dpmzm_init();
+    /* TEMP_DPMZM_BRIDGE_END */
 }
 
 void app_run(void)
@@ -1343,6 +1353,13 @@ void app_run(void)
 
     /* Dispatch any pending UART command (must run in main-loop context, not ISR) */
     app_uart_process();
+
+    /* TEMP_DPMZM_BRIDGE_BEGIN
+     * Temporary background hook for the DPMZM open-loop path.
+     * Remove this line after the DPMZM path gets its own scheduler/entry.
+     */
+    app_dpmzm_run();
+    /* TEMP_DPMZM_BRIDGE_END */
 
     switch (ctx.state) {
     case APP_STATE_INIT:
@@ -1379,6 +1396,29 @@ const app_context_t *app_get_context(void)
 
 void app_handle_command(const char *cmd)
 {
+    /* TEMP_DPMZM_BRIDGE_BEGIN
+     * Temporary UART namespace bridge for DPMZM commands.
+     * Keep the legacy MZM command set unchanged and route only the
+     * "dpmzm ..." namespace to the parallel DPMZM implementation.
+     *
+     * Removal rule:
+     *   Delete this whole block once DPMZM gets an independent command entry.
+     */
+    if (strcmp(cmd, "dpmzm") == 0) {
+        printf("[dpmzm] usage: dpmzm <subcommand>\r\n");
+        printf("         examples:\r\n");
+        printf("           dpmzm status\r\n");
+        printf("           dpmzm set bias i 0.0\r\n");
+        printf("           dpmzm scan matp i -2.0 2.0 0.1\r\n");
+        return;
+    }
+
+    if (strncmp(cmd, "dpmzm ", 6) == 0) {
+        app_dpmzm_handle_command(cmd + 6);
+        return;
+    }
+    /* TEMP_DPMZM_BRIDGE_END */
+
     if (strcmp(cmd, "start") == 0) {
         if (ctx.state == APP_STATE_IDLE) {
             /* Initialize bias controller with current config */

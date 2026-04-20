@@ -137,4 +137,13 @@ if(BUILD_TESTS)
     target_include_directories(test_mzm_phase PRIVATE control/inc dsp/inc)
     target_link_libraries(test_mzm_phase m)
     add_test(NAME mzm_phase COMMAND test_mzm_phase)
+
+    add_executable(test_dpmzm_multifreq
+        test/test_dpmzm_multifreq.c
+        control/src/ctrl_measure_dpmzm.c
+        dsp/src/dsp_goertzel.c
+    )
+    target_include_directories(test_dpmzm_multifreq PRIVATE control/inc dsp/inc)
+    target_link_libraries(test_dpmzm_multifreq m)
+    add_test(NAME dpmzm_multifreq COMMAND test_dpmzm_multifreq)
 endif()
