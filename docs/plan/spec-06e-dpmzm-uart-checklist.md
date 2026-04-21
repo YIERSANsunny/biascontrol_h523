@@ -113,8 +113,8 @@ dpmzm status
 
 ```text
 dpmzm set pilot-src onboard
-dpmzm set pilot i 1000 50
-dpmzm set pilot q 1200 50
+dpmzm set pilot i 1000 200
+dpmzm set pilot q 1200 200
 dpmzm set dump metrics
 dpmzm status
 ```
@@ -122,7 +122,7 @@ dpmzm status
 默认解释:
 
 - `1000` / `1200` = `fI / fQ`
-- `50` = `50 mVpp`
+- `200` = `200 mVpp`
 - `metrics` = 只打印每个扫点的摘要，不打印原始 ADC 样本
 
 ---
@@ -358,8 +358,8 @@ dpmzm set bias i 0.0
 dpmzm set bias q 0.0
 dpmzm set bias p 0.0
 dpmzm set pilot-src onboard
-dpmzm set pilot i 1000 50
-dpmzm set pilot q 1200 50
+dpmzm set pilot i 1000 200
+dpmzm set pilot q 1200 200
 dpmzm set dump metrics
 dpmzm scan matp i -3.0 3.0 0.1 6
 dpmzm scan matp q -3.0 3.0 0.1 6

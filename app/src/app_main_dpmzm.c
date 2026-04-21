@@ -270,7 +270,6 @@ static void handle_scan_placeholder(const char *cmd)
 {
     char cmd_copy[96];
     char *tokens[8] = {0};
-    char *next = NULL;
     char *tok = NULL;
     int token_count = 0;
     dpmzm_scan_request_t req;
@@ -289,10 +288,10 @@ static void handle_scan_placeholder(const char *cmd)
     strncpy(cmd_copy, cmd, sizeof(cmd_copy) - 1U);
     cmd_copy[sizeof(cmd_copy) - 1U] = '\0';
 
-    tok = strtok_s(cmd_copy, " ", &next);
+    tok = strtok(cmd_copy, " ");
     while (tok != NULL && token_count < (int)(sizeof(tokens) / sizeof(tokens[0]))) {
         tokens[token_count++] = tok;
-        tok = strtok_s(NULL, " ", &next);
+        tok = strtok(NULL, " ");
     }
 
     if (token_count < 6) {

@@ -25,7 +25,8 @@ void app_config_dpmzm_defaults(void)
      * Match the currently validated DPMZM experiment plan:
      *   fI = 1000 Hz
      *   fQ = 1200 Hz
-     * with modest default peak amplitudes.
+     * with default pilot amplitudes raised to 200 mVpp
+     * (stored here as 100 mV peak values).
      *
      * The pilot source defaults to ONBOARD because the current requirement is
      * to generate both pilots with the DAC path rather than relying on
@@ -33,8 +34,8 @@ void app_config_dpmzm_defaults(void)
      */
     s_dpmzm_config.pilot_i_freq_hz = 1000.0f;
     s_dpmzm_config.pilot_q_freq_hz = 1200.0f;
-    s_dpmzm_config.pilot_i_amp_v = 0.025f;
-    s_dpmzm_config.pilot_q_amp_v = 0.025f;
+    s_dpmzm_config.pilot_i_amp_v = 0.10f;
+    s_dpmzm_config.pilot_q_amp_v = 0.10f;
     s_dpmzm_config.pilot_source = DPMZM_PILOT_SOURCE_ONBOARD;
 
     /*
