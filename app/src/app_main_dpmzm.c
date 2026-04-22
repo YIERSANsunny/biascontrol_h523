@@ -1,7 +1,9 @@
 #include "app_main_dpmzm.h"
 #include "dsp_types.h"
 #include "ctrl_scan_dpmzm.h"
+#include "drv_board.h"
 #include "drv_dac8568.h"
+#include "spi.h"
 #include "tim.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,18 +18,64 @@ static app_dpmzm_context_t s_dpmzm_ctx;
 static float s_pilot_i_phase_rad = 0.0f;
 static float s_pilot_q_phase_rad = 0.0f;
 static bool s_scan_pilot_active = false;
+static bool s_p_bias_dirty = false;
+static float s_pending_p_bias_v = 0.0f;
+static bool s_scan_restore_valid = false;
+static float s_scan_restore_bias_i_v = 0.0f;
+static float s_scan_restore_bias_q_v = 0.0f;
+static float s_scan_restore_bias_p_v = 0.0f;
+
+#define DPMZM_PILOT_LUT_SIZE            1024U
+#define DPMZM_PILOT_DMA_MAX_FRAMES      3U
+#define DPMZM_PILOT_DAC_FRAME_BYTES     4U
 
 /*
- * TIM6 is configured for an exact 16 kHz update rate. This is intentionally
- * lower than the 64 kSPS ADC rate because the current DAC driver performs
- * blocking SPI writes; 16 kHz keeps ISR load manageable while still providing
- * enough points per cycle for 1 kHz / 1.2 kHz scope observation.
+ * TIM6 is configured for an exact 16 kHz update rate. The continuous pilot
+ * engine now uses a LUT + SPI1 TX DMA sequence, but 16 kHz still leaves ample
+ * headroom for three framed DAC updates (optional P plus I/Q) per sample while
+ * providing enough points per cycle for 1 kHz / 1.2 kHz observation.
  */
 #define DPMZM_PILOT_TIM6_PSC           124U
 #define DPMZM_PILOT_TIM6_ARR           124U
 #define DPMZM_PILOT_TIM6_RATE_HZ       16000.0f
 
 static bool s_pilot_timer_running = false;
+static bool s_pilot_lut_ready = false;
+static float s_pilot_lut[DPMZM_PILOT_LUT_SIZE + 1U];
+static uint8_t s_pilot_dma_frames[DPMZM_PILOT_DMA_MAX_FRAMES][DPMZM_PILOT_DAC_FRAME_BYTES];
+static volatile bool s_pilot_dma_active = false;
+static volatile uint8_t s_pilot_dma_frame_count = 0U;
+static volatile uint8_t s_pilot_dma_frame_index = 0U;
+static volatile bool s_pilot_dma_contains_p = false;
+static float s_pilot_dma_pending_p_v = 0.0f;
+static volatile uint32_t s_pilot_dma_drop_count = 0U;
+static volatile uint32_t s_pilot_dma_error_count = 0U;
+
+static bool pilot_generation_active_internal(void)
+{
+    return s_dpmzm_ctx.initialized &&
+           (s_dpmzm_ctx.pilot_output_enabled || s_scan_pilot_active) &&
+           s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD;
+}
+
+static bool timer_owns_dac_outputs(void)
+{
+    return s_pilot_timer_running && pilot_generation_active_internal();
+}
+
+static void init_pilot_lut_once(void)
+{
+    if (s_pilot_lut_ready) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < DPMZM_PILOT_LUT_SIZE; i++) {
+        float phase = (2.0f * M_PI * (float)i) / (float)DPMZM_PILOT_LUT_SIZE;
+        s_pilot_lut[i] = sinf(phase);
+    }
+    s_pilot_lut[DPMZM_PILOT_LUT_SIZE] = s_pilot_lut[0];
+    s_pilot_lut_ready = true;
+}
 
 static void wrap_phase(float *phase_rad)
 {
@@ -40,6 +88,50 @@ static void wrap_phase(float *phase_rad)
     if (*phase_rad < 0.0f) {
         *phase_rad += 2.0f * M_PI;
     }
+}
+
+static float lut_sample_from_phase(float phase_rad)
+{
+    float lut_index;
+    uint32_t index0;
+    float frac;
+    float v0;
+    float v1;
+
+    wrap_phase(&phase_rad);
+    init_pilot_lut_once();
+
+    lut_index = phase_rad * ((float)DPMZM_PILOT_LUT_SIZE / (2.0f * M_PI));
+    index0 = (uint32_t)lut_index;
+    if (index0 >= DPMZM_PILOT_LUT_SIZE) {
+        index0 = 0U;
+    }
+    frac = lut_index - (float)index0;
+    v0 = s_pilot_lut[index0];
+    v1 = s_pilot_lut[index0 + 1U];
+    return v0 + (v1 - v0) * frac;
+}
+
+static uint32_t build_dac_frame(uint8_t command, uint8_t channel, uint16_t code)
+{
+    uint32_t frame = 0U;
+
+    frame |= ((uint32_t)(command & 0x0FU)) << 24;
+    frame |= ((uint32_t)(channel & 0x0FU)) << 20;
+    frame |= ((uint32_t)code) << 4;
+    return frame;
+}
+
+static void encode_dac_frame(uint8_t command, uint8_t channel, float voltage_v,
+                             uint8_t frame_bytes[DPMZM_PILOT_DAC_FRAME_BYTES])
+{
+    uint32_t frame = build_dac_frame(command, channel,
+                                     board_voltage_to_dac_code(voltage_v));
+
+    frame_bytes[0] = (uint8_t)(frame >> 24);
+    frame_bytes[1] = (uint8_t)(frame >> 16);
+    frame_bytes[2] = (uint8_t)(frame >> 8);
+    frame_bytes[3] = (uint8_t)(frame);
 }
 
 static const char *pilot_source_name(dpmzm_pilot_source_t source)
@@ -109,6 +201,8 @@ static int apply_biases(void)
     if (ret_q != 0) {
         return ret_q;
     }
+    s_p_bias_dirty = false;
+    s_pending_p_bias_v = s_dpmzm_ctx.bias_p_v;
     return ret_p;
 }
 
@@ -135,11 +229,94 @@ static int apply_current_drive(void)
 
     if (s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD &&
         (s_dpmzm_ctx.pilot_output_enabled || s_scan_pilot_active)) {
-        tone_i_v = s_dpmzm_ctx.config->pilot_i_amp_v * sinf(s_pilot_i_phase_rad);
-        tone_q_v = s_dpmzm_ctx.config->pilot_q_amp_v * sinf(s_pilot_q_phase_rad);
+        tone_i_v = s_dpmzm_ctx.config->pilot_i_amp_v * lut_sample_from_phase(s_pilot_i_phase_rad);
+        tone_q_v = s_dpmzm_ctx.config->pilot_q_amp_v * lut_sample_from_phase(s_pilot_q_phase_rad);
     }
 
     return apply_drive(tone_i_v, tone_q_v);
+}
+
+static void update_bias_triplet_state(float vi, float vq, float vp)
+{
+    __disable_irq();
+    s_dpmzm_ctx.bias_i_v = vi;
+    s_dpmzm_ctx.bias_q_v = vq;
+    s_dpmzm_ctx.bias_p_v = vp;
+    s_pending_p_bias_v = vp;
+    s_p_bias_dirty = true;
+    __enable_irq();
+}
+
+static void update_single_bias_state(char path, float value)
+{
+    __disable_irq();
+    switch (path) {
+    case 'i':
+        s_dpmzm_ctx.bias_i_v = value;
+        break;
+    case 'q':
+        s_dpmzm_ctx.bias_q_v = value;
+        break;
+    case 'p':
+        s_dpmzm_ctx.bias_p_v = value;
+        s_pending_p_bias_v = value;
+        s_p_bias_dirty = true;
+        break;
+    default:
+        break;
+    }
+    __enable_irq();
+}
+
+static bool consume_pending_p_bias(float *vp_out)
+{
+    bool dirty = false;
+
+    if (vp_out == NULL) {
+        return false;
+    }
+
+    __disable_irq();
+    dirty = s_p_bias_dirty;
+    if (dirty) {
+        *vp_out = s_pending_p_bias_v;
+        s_p_bias_dirty = false;
+    }
+    __enable_irq();
+
+    return dirty;
+}
+
+static void capture_scan_restore_biases(void)
+{
+    __disable_irq();
+    s_scan_restore_bias_i_v = s_dpmzm_ctx.bias_i_v;
+    s_scan_restore_bias_q_v = s_dpmzm_ctx.bias_q_v;
+    s_scan_restore_bias_p_v = s_dpmzm_ctx.bias_p_v;
+    s_scan_restore_valid = true;
+    __enable_irq();
+}
+
+static void restore_scan_biases_to_context(void)
+{
+    __disable_irq();
+    if (s_scan_restore_valid) {
+        s_dpmzm_ctx.bias_i_v = s_scan_restore_bias_i_v;
+        s_dpmzm_ctx.bias_q_v = s_scan_restore_bias_q_v;
+        s_dpmzm_ctx.bias_p_v = s_scan_restore_bias_p_v;
+        s_pending_p_bias_v = s_scan_restore_bias_p_v;
+        s_p_bias_dirty = false;
+        s_scan_restore_valid = false;
+    }
+    __enable_irq();
+}
+
+static void requeue_pending_p_bias(float vp)
+{
+    __disable_irq();
+    s_pending_p_bias_v = vp;
+    s_p_bias_dirty = true;
+    __enable_irq();
 }
 
 static void reset_pilot_phases(void)
@@ -154,23 +331,106 @@ static void stop_pilot_timer(void)
         (void)HAL_TIM_Base_Stop_IT(&htim6);
         s_pilot_timer_running = false;
     }
-}
 
-static void start_pilot_timer(void)
-{
-    if (!s_dpmzm_ctx.initialized ||
-        (!s_dpmzm_ctx.pilot_output_enabled && !s_scan_pilot_active) ||
-        s_dpmzm_ctx.config->pilot_source != DPMZM_PILOT_SOURCE_ONBOARD) {
-        return;
+    if (s_pilot_dma_active || hspi1.State != HAL_SPI_STATE_READY) {
+        (void)HAL_SPI_Abort(&hspi1);
     }
 
+    board_dac_cs_high();
+    __disable_irq();
+    s_pilot_dma_active = false;
+    s_pilot_dma_frame_count = 0U;
+    s_pilot_dma_frame_index = 0U;
+    s_pilot_dma_contains_p = false;
+    __enable_irq();
+}
+
+static bool start_pilot_timer(void)
+{
+    if (!pilot_generation_active_internal()) {
+        return false;
+    }
+
+    init_pilot_lut_once();
     __HAL_TIM_SET_COUNTER(&htim6, 0U);
     if (HAL_TIM_Base_Start_IT(&htim6) == HAL_OK) {
         s_pilot_timer_running = true;
+        return true;
     } else {
         s_pilot_timer_running = false;
         printf("[dpmzm] WARN: failed to start TIM6 pilot timer\r\n");
+        return false;
     }
+}
+
+static bool start_spi1_dma_frame(uint8_t frame_index)
+{
+    HAL_StatusTypeDef status;
+
+    board_dac_cs_low();
+    status = HAL_SPI_Transmit_DMA(&hspi1,
+                                  s_pilot_dma_frames[frame_index],
+                                  DPMZM_PILOT_DAC_FRAME_BYTES);
+    if (status != HAL_OK) {
+        board_dac_cs_high();
+        return false;
+    }
+    return true;
+}
+
+static bool schedule_pilot_dma_sequence(float tone_i_v, float tone_q_v,
+                                        bool include_p_frame, float pending_p_v)
+{
+    uint8_t frame_count = 0U;
+
+    if (s_pilot_dma_active) {
+        s_pilot_dma_drop_count++;
+        return false;
+    }
+
+    if (include_p_frame) {
+        encode_dac_frame(DAC8568_CMD_WRITE_REG,
+                         s_dpmzm_ctx.config->bias_p_dac_channel,
+                         pending_p_v,
+                         s_pilot_dma_frames[frame_count]);
+        frame_count++;
+    }
+
+    encode_dac_frame(DAC8568_CMD_WRITE_REG,
+                     s_dpmzm_ctx.config->bias_i_dac_channel,
+                     s_dpmzm_ctx.bias_i_v + tone_i_v,
+                     s_pilot_dma_frames[frame_count]);
+    frame_count++;
+
+    encode_dac_frame(DAC8568_CMD_WRITE_REG,
+                     s_dpmzm_ctx.config->bias_q_dac_channel,
+                     s_dpmzm_ctx.bias_q_v + tone_q_v,
+                     s_pilot_dma_frames[frame_count]);
+    frame_count++;
+
+    __disable_irq();
+    s_pilot_dma_active = true;
+    s_pilot_dma_frame_count = frame_count;
+    s_pilot_dma_frame_index = 0U;
+    s_pilot_dma_contains_p = include_p_frame;
+    s_pilot_dma_pending_p_v = pending_p_v;
+    __enable_irq();
+
+    if (!start_spi1_dma_frame(0U)) {
+        __disable_irq();
+        s_pilot_dma_active = false;
+        s_pilot_dma_frame_count = 0U;
+        s_pilot_dma_frame_index = 0U;
+        s_pilot_dma_contains_p = false;
+        __enable_irq();
+        s_pilot_dma_error_count++;
+        if (include_p_frame) {
+            requeue_pending_p_bias(pending_p_v);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 static void drive_next_sample_internal(void)
@@ -179,16 +439,19 @@ static void drive_next_sample_internal(void)
     float tone_q_v = 0.0f;
     float phase_step_i;
     float phase_step_q;
+    float pending_p_v = 0.0f;
+    bool include_p_frame = false;
 
-    if (!s_dpmzm_ctx.initialized ||
-        !s_dpmzm_ctx.pilot_output_enabled ||
-        s_dpmzm_ctx.config->pilot_source != DPMZM_PILOT_SOURCE_ONBOARD) {
+    if (!pilot_generation_active_internal()) {
         return;
     }
 
-    tone_i_v = s_dpmzm_ctx.config->pilot_i_amp_v * sinf(s_pilot_i_phase_rad);
-    tone_q_v = s_dpmzm_ctx.config->pilot_q_amp_v * sinf(s_pilot_q_phase_rad);
-    (void)apply_drive(tone_i_v, tone_q_v);
+    include_p_frame = consume_pending_p_bias(&pending_p_v);
+    tone_i_v = s_dpmzm_ctx.config->pilot_i_amp_v * lut_sample_from_phase(s_pilot_i_phase_rad);
+    tone_q_v = s_dpmzm_ctx.config->pilot_q_amp_v * lut_sample_from_phase(s_pilot_q_phase_rad);
+    if (!schedule_pilot_dma_sequence(tone_i_v, tone_q_v, include_p_frame, pending_p_v)) {
+        return;
+    }
 
     phase_step_i = (2.0f * M_PI * s_dpmzm_ctx.config->pilot_i_freq_hz) /
                    DPMZM_PILOT_TIM6_RATE_HZ;
@@ -240,6 +503,10 @@ static void print_status(void)
     printf("  pilot Q:       %.1f Hz, %.1f mVpp\r\n",
            (double)s_dpmzm_ctx.config->pilot_q_freq_hz,
            (double)(s_dpmzm_ctx.config->pilot_q_amp_v * 2000.0f));
+    printf("  pilot dma:     %s, drops=%lu errors=%lu\r\n",
+           s_pilot_dma_active ? "active" : "idle",
+           (unsigned long)s_pilot_dma_drop_count,
+           (unsigned long)s_pilot_dma_error_count);
     printf("  dump mode:     %s\r\n",
            dump_mode_name(s_dpmzm_ctx.config->dump_mode));
     printf("  scan blocks:   %lu\r\n",
@@ -254,7 +521,7 @@ static void handle_set_pilot_open(const char *cmd)
         s_dpmzm_ctx.pilot_output_enabled = true;
         reset_pilot_phases();
         drive_next_sample_internal();
-        start_pilot_timer();
+        (void)start_pilot_timer();
         printf("[dpmzm] pilot output -> continuous\r\n");
     } else if (strcmp(arg, "off") == 0) {
         s_dpmzm_ctx.pilot_output_enabled = false;
@@ -291,20 +558,22 @@ static void handle_set_bias(const char *cmd)
 
     switch (path) {
     case 'i':
-        s_dpmzm_ctx.bias_i_v = value;
         break;
     case 'q':
-        s_dpmzm_ctx.bias_q_v = value;
         break;
     case 'p':
-        s_dpmzm_ctx.bias_p_v = value;
         break;
     default:
         printf("[dpmzm] usage: set bias i|q|p <voltage>\r\n");
         return;
     }
 
-    ret = apply_biases();
+    update_single_bias_state(path, value);
+    if (timer_owns_dac_outputs()) {
+        ret = 0;
+    } else {
+        ret = apply_biases();
+    }
     printf("[dpmzm] bias %c -> %+.3f V (ret=%d)\r\n",
            path, (double)value, ret);
 }
@@ -316,7 +585,8 @@ static void handle_set_pilot_src(const char *cmd)
     if (strcmp(arg, "onboard") == 0) {
         s_dpmzm_ctx.config->pilot_source = DPMZM_PILOT_SOURCE_ONBOARD;
         if (s_dpmzm_ctx.pilot_output_enabled) {
-            start_pilot_timer();
+            stop_pilot_timer();
+            (void)start_pilot_timer();
         }
     } else if (strcmp(arg, "external") == 0) {
         printf("[dpmzm] external pilot source is reserved but disabled in the current plan\r\n");
@@ -526,7 +796,10 @@ static void handle_scan_placeholder(const char *cmd)
            (double)req.step_v,
            blocks);
 
-    (void)app_dpmzm_scan_begin(req.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD);
+    if (!app_dpmzm_scan_begin(req.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
+        printf("[dpmzm] scan failed: onboard pilot start failed\r\n");
+        return;
+    }
     ok = dpmzm_scan_run(&req, &summary);
     app_dpmzm_scan_end();
     if (!ok) {
@@ -551,6 +824,16 @@ void app_dpmzm_init(void)
     reset_pilot_phases();
     s_pilot_timer_running = false;
     s_scan_pilot_active = false;
+    s_p_bias_dirty = false;
+    s_pending_p_bias_v = s_dpmzm_ctx.bias_p_v;
+    s_scan_restore_valid = false;
+    s_pilot_dma_active = false;
+    s_pilot_dma_frame_count = 0U;
+    s_pilot_dma_frame_index = 0U;
+    s_pilot_dma_contains_p = false;
+    s_pilot_dma_pending_p_v = s_dpmzm_ctx.bias_p_v;
+    s_pilot_dma_drop_count = 0U;
+    s_pilot_dma_error_count = 0U;
     s_dpmzm_ctx.initialized = true;
 }
 
@@ -597,14 +880,68 @@ void app_dpmzm_handle_command(const char *cmd)
 
 bool app_dpmzm_pilot_output_active(void)
 {
-    return s_dpmzm_ctx.initialized &&
-           (s_dpmzm_ctx.pilot_output_enabled || s_scan_pilot_active) &&
-           s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD;
+    return pilot_generation_active_internal();
 }
 
 void app_dpmzm_drive_next_sample(void)
 {
     drive_next_sample_internal();
+}
+
+void app_dpmzm_pilot_spi_tx_cplt(void)
+{
+    bool start_next = false;
+    uint8_t next_index = 0U;
+
+    board_dac_cs_high();
+
+    __disable_irq();
+    if (!s_pilot_dma_active) {
+        __enable_irq();
+        return;
+    }
+
+    s_pilot_dma_frame_index++;
+    if (s_pilot_dma_frame_index < s_pilot_dma_frame_count) {
+        next_index = s_pilot_dma_frame_index;
+        start_next = true;
+    } else {
+        s_pilot_dma_active = false;
+        s_pilot_dma_frame_count = 0U;
+        s_pilot_dma_frame_index = 0U;
+        s_pilot_dma_contains_p = false;
+    }
+    __enable_irq();
+
+    if (start_next) {
+        if (!start_spi1_dma_frame(next_index)) {
+            app_dpmzm_pilot_spi_error();
+        }
+    } else {
+        board_dac_ldac_pulse();
+    }
+}
+
+void app_dpmzm_pilot_spi_error(void)
+{
+    bool restore_p = false;
+    float restore_p_v = 0.0f;
+
+    board_dac_cs_high();
+
+    __disable_irq();
+    restore_p = s_pilot_dma_contains_p;
+    restore_p_v = s_pilot_dma_pending_p_v;
+    s_pilot_dma_active = false;
+    s_pilot_dma_frame_count = 0U;
+    s_pilot_dma_frame_index = 0U;
+    s_pilot_dma_contains_p = false;
+    s_pilot_dma_error_count++;
+    __enable_irq();
+
+    if (restore_p) {
+        requeue_pending_p_bias(restore_p_v);
+    }
 }
 
 bool app_dpmzm_scan_begin(bool use_onboard_pilot)
@@ -613,6 +950,7 @@ bool app_dpmzm_scan_begin(bool use_onboard_pilot)
         app_dpmzm_init();
     }
 
+    capture_scan_restore_biases();
     stop_pilot_timer();
     s_scan_pilot_active = false;
 
@@ -621,7 +959,12 @@ bool app_dpmzm_scan_begin(bool use_onboard_pilot)
         s_scan_pilot_active = true;
         reset_pilot_phases();
         (void)apply_current_drive();
-        start_pilot_timer();
+        if (!start_pilot_timer()) {
+            s_scan_pilot_active = false;
+            restore_scan_biases_to_context();
+            (void)apply_biases();
+            return false;
+        }
     } else {
         (void)apply_biases();
     }
@@ -634,26 +977,19 @@ void app_dpmzm_scan_end(void)
     stop_pilot_timer();
     s_scan_pilot_active = false;
     reset_pilot_phases();
+    restore_scan_biases_to_context();
     (void)apply_biases();
     if (s_dpmzm_ctx.pilot_output_enabled) {
-        start_pilot_timer();
+        (void)start_pilot_timer();
     }
 }
 
 int app_dpmzm_scan_apply_bias_triplet(float vi, float vq, float vp)
 {
-    s_dpmzm_ctx.bias_i_v = vi;
-    s_dpmzm_ctx.bias_q_v = vq;
-    s_dpmzm_ctx.bias_p_v = vp;
+    update_bias_triplet_state(vi, vq, vp);
 
-    if (s_scan_pilot_active &&
-        s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD) {
-        int ret_p = dac8568_set_voltage(s_dpmzm_ctx.config->bias_p_dac_channel, vp);
-        int ret_iq = apply_current_drive();
-        if (ret_p != 0) {
-            return ret_p;
-        }
-        return ret_iq;
+    if (timer_owns_dac_outputs()) {
+        return 0;
     }
 
     return apply_biases();

@@ -53,10 +53,23 @@ bool app_dpmzm_pilot_output_active(void);
 /**
  * Advance one pilot sample and write the current I/Q outputs to DAC.
  *
- * This is primarily intended for the TIM6 interrupt path. It remains exposed
- * so bench tools can force a single update when needed.
+ * This is primarily intended for the TIM6-driven continuous pilot path. It
+ * remains exposed so bench tools can force a single update when needed.
  */
 void app_dpmzm_drive_next_sample(void);
+
+/**
+ * SPI1 TX-DMA complete hook for the DPMZM continuous pilot engine.
+ *
+ * The DAC8568 pilot path uses SPI1 TX DMA to stream prebuilt LUT frames, so
+ * the SPI1 callback dispatcher routes completion here.
+ */
+void app_dpmzm_pilot_spi_tx_cplt(void);
+
+/**
+ * SPI1 error hook for the DPMZM continuous pilot engine.
+ */
+void app_dpmzm_pilot_spi_error(void);
 
 /**
  * Prepare the continuous pilot engine for a scan.
@@ -76,9 +89,10 @@ void app_dpmzm_scan_end(void);
 /**
  * Apply a new I/Q/P bias triplet for scan operation.
  *
- * This updates the DPMZM context and the actual DAC outputs. When a continuous
- * pilot is active, the current pilot phase is preserved and only the base
- * biases are changed.
+ * This updates the DPMZM context and commits the new base biases. When a
+ * continuous pilot is active, foreground scan code no longer writes DAC
+ * outputs directly; the TIM6 pilot path becomes the sole I/Q writer and will
+ * pick up the new base biases on its next update.
  */
 int app_dpmzm_scan_apply_bias_triplet(float vi, float vq, float vp);
 
