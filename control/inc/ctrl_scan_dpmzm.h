@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include "ctrl_measure_dpmzm.h"
 
+typedef int (*dpmzm_scan_bias_apply_fn_t)(float vi, float vq, float vp);
+
 typedef enum {
     DPMZM_SCAN_STAGE_MATP = 0,
     DPMZM_SCAN_STAGE_QTP,
@@ -56,6 +58,8 @@ typedef struct {
     float pilot_q_amp_v;
     dpmzm_scan_pilot_mode_t pilot_mode;
     dpmzm_scan_dump_mode_t dump_mode;
+    bool continuous_onboard_pilot;
+    dpmzm_scan_bias_apply_fn_t bias_apply_fn;
 } dpmzm_scan_request_t;
 
 typedef struct {

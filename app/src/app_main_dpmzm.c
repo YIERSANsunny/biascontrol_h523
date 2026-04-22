@@ -15,6 +15,7 @@
 static app_dpmzm_context_t s_dpmzm_ctx;
 static float s_pilot_i_phase_rad = 0.0f;
 static float s_pilot_q_phase_rad = 0.0f;
+static bool s_scan_pilot_active = false;
 
 /*
  * TIM6 is configured for an exact 16 kHz update rate. This is intentionally
@@ -127,6 +128,20 @@ static int apply_drive(float tone_i_v, float tone_q_v)
     return 0;
 }
 
+static int apply_current_drive(void)
+{
+    float tone_i_v = 0.0f;
+    float tone_q_v = 0.0f;
+
+    if (s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD &&
+        (s_dpmzm_ctx.pilot_output_enabled || s_scan_pilot_active)) {
+        tone_i_v = s_dpmzm_ctx.config->pilot_i_amp_v * sinf(s_pilot_i_phase_rad);
+        tone_q_v = s_dpmzm_ctx.config->pilot_q_amp_v * sinf(s_pilot_q_phase_rad);
+    }
+
+    return apply_drive(tone_i_v, tone_q_v);
+}
+
 static void reset_pilot_phases(void)
 {
     s_pilot_i_phase_rad = 0.0f;
@@ -144,7 +159,7 @@ static void stop_pilot_timer(void)
 static void start_pilot_timer(void)
 {
     if (!s_dpmzm_ctx.initialized ||
-        !s_dpmzm_ctx.pilot_output_enabled ||
+        (!s_dpmzm_ctx.pilot_output_enabled && !s_scan_pilot_active) ||
         s_dpmzm_ctx.config->pilot_source != DPMZM_PILOT_SOURCE_ONBOARD) {
         return;
     }
@@ -500,6 +515,8 @@ static void handle_scan_placeholder(const char *cmd)
     req.pilot_q_amp_v = s_dpmzm_ctx.config->pilot_q_amp_v;
     req.pilot_mode = to_scan_pilot_mode(s_dpmzm_ctx.config->pilot_source);
     req.dump_mode = to_scan_dump_mode(s_dpmzm_ctx.config->dump_mode);
+    req.continuous_onboard_pilot = (req.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD);
+    req.bias_apply_fn = app_dpmzm_scan_apply_bias_triplet;
 
     printf("[dpmzm] scan start: stage=%s target=%s start=%+.3f stop=%+.3f step=%+.3f blocks=%lu\r\n",
            dpmzm_scan_stage_name(req.stage),
@@ -509,12 +526,9 @@ static void handle_scan_placeholder(const char *cmd)
            (double)req.step_v,
            blocks);
 
-    stop_pilot_timer();
+    (void)app_dpmzm_scan_begin(req.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD);
     ok = dpmzm_scan_run(&req, &summary);
-    (void)apply_biases();
-    if (s_dpmzm_ctx.pilot_output_enabled) {
-        start_pilot_timer();
-    }
+    app_dpmzm_scan_end();
     if (!ok) {
         printf("[dpmzm] scan failed\r\n");
         return;
@@ -536,6 +550,7 @@ void app_dpmzm_init(void)
     s_dpmzm_ctx.pilot_output_enabled = false;
     reset_pilot_phases();
     s_pilot_timer_running = false;
+    s_scan_pilot_active = false;
     s_dpmzm_ctx.initialized = true;
 }
 
@@ -583,13 +598,65 @@ void app_dpmzm_handle_command(const char *cmd)
 bool app_dpmzm_pilot_output_active(void)
 {
     return s_dpmzm_ctx.initialized &&
-           s_dpmzm_ctx.pilot_output_enabled &&
+           (s_dpmzm_ctx.pilot_output_enabled || s_scan_pilot_active) &&
            s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD;
 }
 
 void app_dpmzm_drive_next_sample(void)
 {
     drive_next_sample_internal();
+}
+
+bool app_dpmzm_scan_begin(bool use_onboard_pilot)
+{
+    if (!s_dpmzm_ctx.initialized) {
+        app_dpmzm_init();
+    }
+
+    stop_pilot_timer();
+    s_scan_pilot_active = false;
+
+    if (use_onboard_pilot &&
+        s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD) {
+        s_scan_pilot_active = true;
+        reset_pilot_phases();
+        (void)apply_current_drive();
+        start_pilot_timer();
+    } else {
+        (void)apply_biases();
+    }
+
+    return true;
+}
+
+void app_dpmzm_scan_end(void)
+{
+    stop_pilot_timer();
+    s_scan_pilot_active = false;
+    reset_pilot_phases();
+    (void)apply_biases();
+    if (s_dpmzm_ctx.pilot_output_enabled) {
+        start_pilot_timer();
+    }
+}
+
+int app_dpmzm_scan_apply_bias_triplet(float vi, float vq, float vp)
+{
+    s_dpmzm_ctx.bias_i_v = vi;
+    s_dpmzm_ctx.bias_q_v = vq;
+    s_dpmzm_ctx.bias_p_v = vp;
+
+    if (s_scan_pilot_active &&
+        s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD) {
+        int ret_p = dac8568_set_voltage(s_dpmzm_ctx.config->bias_p_dac_channel, vp);
+        int ret_iq = apply_current_drive();
+        if (ret_p != 0) {
+            return ret_p;
+        }
+        return ret_iq;
+    }
+
+    return apply_biases();
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)

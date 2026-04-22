@@ -220,6 +220,22 @@ static int apply_bias_triplet(uint8_t ch_i,
     return ret_p;
 }
 
+static int apply_scan_biases(const dpmzm_scan_request_t *req,
+                             float vi,
+                             float vq,
+                             float vp)
+{
+    if (req != NULL && req->bias_apply_fn != NULL) {
+        return req->bias_apply_fn(vi, vq, vp);
+    }
+    return apply_bias_triplet(req->bias_i_dac_channel,
+                              req->bias_q_dac_channel,
+                              req->bias_p_dac_channel,
+                              vi,
+                              vq,
+                              vp);
+}
+
 static void point_base_biases(const dpmzm_scan_request_t *req,
                               float sweep_value,
                               float *vi,
@@ -314,12 +330,7 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
     }
 
     point_base_biases(req, sweep_value, &base_vi, &base_vq, &base_vp);
-    if (apply_bias_triplet(req->bias_i_dac_channel,
-                           req->bias_q_dac_channel,
-                           req->bias_p_dac_channel,
-                           base_vi,
-                           base_vq,
-                           base_vp) != 0) {
+    if (apply_scan_biases(req, base_vi, base_vq, base_vp) != 0) {
         return false;
     }
 
@@ -330,48 +341,51 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
                        req->pilot_q_freq_hz,
                        (float)DSP_SAMPLE_RATE_HZ,
                        DSP_GOERTZEL_BLOCK_SIZE);
-    tone_gen_init(&tone_i,
-                  req->pilot_i_freq_hz,
-                  (float)DSP_SAMPLE_RATE_HZ,
-                  req->pilot_i_amp_v);
-    tone_gen_init(&tone_q,
-                  req->pilot_q_freq_hz,
-                  (float)DSP_SAMPLE_RATE_HZ,
-                  req->pilot_q_amp_v);
+    if (req->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD &&
+        !req->continuous_onboard_pilot) {
+        tone_gen_init(&tone_i,
+                      req->pilot_i_freq_hz,
+                      (float)DSP_SAMPLE_RATE_HZ,
+                      req->pilot_i_amp_v);
+        tone_gen_init(&tone_q,
+                      req->pilot_q_freq_hz,
+                      (float)DSP_SAMPLE_RATE_HZ,
+                      req->pilot_q_amp_v);
+    }
 
     for (b = 0; b < req->blocks; b++) {
         uint32_t s;
 
         dpmzm_measure_reset(&measure_ctx);
-        tone_gen_reset(&tone_i);
-        tone_gen_reset(&tone_q);
+        if (req->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD &&
+            !req->continuous_onboard_pilot) {
+            tone_gen_reset(&tone_i);
+            tone_gen_reset(&tone_q);
+        }
 
         for (s = 0; s < DSP_GOERTZEL_BLOCK_SIZE; s++) {
-            float drive_vi = base_vi;
-            float drive_vq = base_vq;
             float sample_ac_v = 0.0f;
             float sample_dc_v = 0.0f;
 
             /*
-             * First DPMZM open-loop version:
-             * drive I/Q sample-by-sample from the foreground scan routine so we
-             * can validate the algorithm end-to-end without touching the legacy
-             * MZM runtime. If later hardware tests show that this blocking path
-             * is too slow, the pilot generation can move to a timer/DMA engine
-             * without changing the scan command or CSV format.
+             * Onboard-pilot scans now prefer the continuously running TIM6
+             * generator prepared by app_dpmzm_scan_begin(). This avoids
+             * rewriting DAC outputs immediately before each ADC sample, which
+             * was injecting large step-update artifacts into the observed
+             * spectrum. The old foreground tone generator remains available as
+             * a fallback when continuous_onboard_pilot is disabled.
              */
-            if (req->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD) {
+            if (req->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD &&
+                !req->continuous_onboard_pilot) {
+                float drive_vi = base_vi;
+                float drive_vq = base_vq;
+
                 drive_vi += tone_gen_next(&tone_i);
                 drive_vq += tone_gen_next(&tone_q);
-            }
 
-            if (apply_bias_triplet(req->bias_i_dac_channel,
-                                   req->bias_q_dac_channel,
-                                   req->bias_p_dac_channel,
-                                   drive_vi,
-                                   drive_vq,
-                                   base_vp) != 0) {
-                return false;
+                if (apply_scan_biases(req, drive_vi, drive_vq, base_vp) != 0) {
+                    return false;
+                }
             }
 
             if (!wait_and_read_sample(&sample_ac_v, &sample_dc_v)) {
@@ -411,12 +425,7 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
     out->dc_mean = sum_dc / (float)req->blocks;
     out->sample_count = req->blocks * DSP_GOERTZEL_BLOCK_SIZE;
 
-    (void)apply_bias_triplet(req->bias_i_dac_channel,
-                             req->bias_q_dac_channel,
-                             req->bias_p_dac_channel,
-                             base_vi,
-                             base_vq,
-                             base_vp);
+    (void)apply_scan_biases(req, base_vi, base_vq, base_vp);
     return true;
 }
 

@@ -58,4 +58,28 @@ bool app_dpmzm_pilot_output_active(void);
  */
 void app_dpmzm_drive_next_sample(void);
 
+/**
+ * Prepare the continuous pilot engine for a scan.
+ *
+ * When onboard pilots are requested, this starts TIM6-driven output even if
+ * the user selected "scan-only" mode so scan acquisition can observe a
+ * continuously running analog pilot rather than a foreground-updated
+ * step-by-step waveform.
+ */
+bool app_dpmzm_scan_begin(bool use_onboard_pilot);
+
+/**
+ * Restore normal pilot behavior after a scan finishes.
+ */
+void app_dpmzm_scan_end(void);
+
+/**
+ * Apply a new I/Q/P bias triplet for scan operation.
+ *
+ * This updates the DPMZM context and the actual DAC outputs. When a continuous
+ * pilot is active, the current pilot phase is preserved and only the base
+ * biases are changed.
+ */
+int app_dpmzm_scan_apply_bias_triplet(float vi, float vq, float vp);
+
 #endif /* APP_MAIN_DPMZM_H */
