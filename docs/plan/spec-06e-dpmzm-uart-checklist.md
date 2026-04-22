@@ -25,6 +25,7 @@
 - `dpmzm set bias q <V>`
 - `dpmzm set bias p <V>`
 - `dpmzm set pilot-src onboard`
+- `dpmzm set pilot-open on|off`
 - `dpmzm set pilot i <freq_hz> <mVpp>`
 - `dpmzm set pilot q <freq_hz> <mVpp>`
 - `dpmzm set dump metrics|raw|both`
@@ -358,6 +359,7 @@ dpmzm set bias i 0.0
 dpmzm set bias q 0.0
 dpmzm set bias p 0.0
 dpmzm set pilot-src onboard
+dpmzm set pilot-open on
 dpmzm set pilot i 1000 200
 dpmzm set pilot q 1200 200
 dpmzm set dump metrics

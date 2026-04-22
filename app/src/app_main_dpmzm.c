@@ -1,11 +1,45 @@
 #include "app_main_dpmzm.h"
+#include "dsp_types.h"
 #include "ctrl_scan_dpmzm.h"
 #include "drv_dac8568.h"
+#include "tim.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
 static app_dpmzm_context_t s_dpmzm_ctx;
+static float s_pilot_i_phase_rad = 0.0f;
+static float s_pilot_q_phase_rad = 0.0f;
+
+/*
+ * TIM6 is configured for an exact 16 kHz update rate. This is intentionally
+ * lower than the 64 kSPS ADC rate because the current DAC driver performs
+ * blocking SPI writes; 16 kHz keeps ISR load manageable while still providing
+ * enough points per cycle for 1 kHz / 1.2 kHz scope observation.
+ */
+#define DPMZM_PILOT_TIM6_PSC           124U
+#define DPMZM_PILOT_TIM6_ARR           124U
+#define DPMZM_PILOT_TIM6_RATE_HZ       16000.0f
+
+static bool s_pilot_timer_running = false;
+
+static void wrap_phase(float *phase_rad)
+{
+    if (phase_rad == NULL) {
+        return;
+    }
+    if (*phase_rad >= 2.0f * M_PI || *phase_rad <= -2.0f * M_PI) {
+        *phase_rad = fmodf(*phase_rad, 2.0f * M_PI);
+    }
+    if (*phase_rad < 0.0f) {
+        *phase_rad += 2.0f * M_PI;
+    }
+}
 
 static const char *pilot_source_name(dpmzm_pilot_source_t source)
 {
@@ -77,6 +111,80 @@ static int apply_biases(void)
     return ret_p;
 }
 
+static int apply_drive(float tone_i_v, float tone_q_v)
+{
+    int ret_i = dac8568_set_voltage(s_dpmzm_ctx.config->bias_i_dac_channel,
+                                    s_dpmzm_ctx.bias_i_v + tone_i_v);
+    int ret_q = dac8568_set_voltage(s_dpmzm_ctx.config->bias_q_dac_channel,
+                                    s_dpmzm_ctx.bias_q_v + tone_q_v);
+
+    if (ret_i != 0) {
+        return ret_i;
+    }
+    if (ret_q != 0) {
+        return ret_q;
+    }
+    return 0;
+}
+
+static void reset_pilot_phases(void)
+{
+    s_pilot_i_phase_rad = 0.0f;
+    s_pilot_q_phase_rad = 0.0f;
+}
+
+static void stop_pilot_timer(void)
+{
+    if (s_pilot_timer_running) {
+        (void)HAL_TIM_Base_Stop_IT(&htim6);
+        s_pilot_timer_running = false;
+    }
+}
+
+static void start_pilot_timer(void)
+{
+    if (!s_dpmzm_ctx.initialized ||
+        !s_dpmzm_ctx.pilot_output_enabled ||
+        s_dpmzm_ctx.config->pilot_source != DPMZM_PILOT_SOURCE_ONBOARD) {
+        return;
+    }
+
+    __HAL_TIM_SET_COUNTER(&htim6, 0U);
+    if (HAL_TIM_Base_Start_IT(&htim6) == HAL_OK) {
+        s_pilot_timer_running = true;
+    } else {
+        s_pilot_timer_running = false;
+        printf("[dpmzm] WARN: failed to start TIM6 pilot timer\r\n");
+    }
+}
+
+static void drive_next_sample_internal(void)
+{
+    float tone_i_v = 0.0f;
+    float tone_q_v = 0.0f;
+    float phase_step_i;
+    float phase_step_q;
+
+    if (!s_dpmzm_ctx.initialized ||
+        !s_dpmzm_ctx.pilot_output_enabled ||
+        s_dpmzm_ctx.config->pilot_source != DPMZM_PILOT_SOURCE_ONBOARD) {
+        return;
+    }
+
+    tone_i_v = s_dpmzm_ctx.config->pilot_i_amp_v * sinf(s_pilot_i_phase_rad);
+    tone_q_v = s_dpmzm_ctx.config->pilot_q_amp_v * sinf(s_pilot_q_phase_rad);
+    (void)apply_drive(tone_i_v, tone_q_v);
+
+    phase_step_i = (2.0f * M_PI * s_dpmzm_ctx.config->pilot_i_freq_hz) /
+                   DPMZM_PILOT_TIM6_RATE_HZ;
+    phase_step_q = (2.0f * M_PI * s_dpmzm_ctx.config->pilot_q_freq_hz) /
+                   DPMZM_PILOT_TIM6_RATE_HZ;
+    s_pilot_i_phase_rad += phase_step_i;
+    s_pilot_q_phase_rad += phase_step_q;
+    wrap_phase(&s_pilot_i_phase_rad);
+    wrap_phase(&s_pilot_q_phase_rad);
+}
+
 static bool parse_float_arg(const char *text, float *value_out)
 {
     char *endptr = NULL;
@@ -109,6 +217,8 @@ static void print_status(void)
            (double)s_dpmzm_ctx.bias_p_v);
     printf("  pilot source:  %s\r\n",
            pilot_source_name(s_dpmzm_ctx.config->pilot_source));
+    printf("  pilot output:  %s\r\n",
+           s_dpmzm_ctx.pilot_output_enabled ? "continuous" : "scan-only");
     printf("  pilot I:       %.1f Hz, %.1f mVpp\r\n",
            (double)s_dpmzm_ctx.config->pilot_i_freq_hz,
            (double)(s_dpmzm_ctx.config->pilot_i_amp_v * 2000.0f));
@@ -119,6 +229,27 @@ static void print_status(void)
            dump_mode_name(s_dpmzm_ctx.config->dump_mode));
     printf("  scan blocks:   %lu\r\n",
            (unsigned long)s_dpmzm_ctx.config->scan_default_blocks);
+}
+
+static void handle_set_pilot_open(const char *cmd)
+{
+    const char *arg = cmd + strlen("set pilot-open ");
+
+    if (strcmp(arg, "on") == 0) {
+        s_dpmzm_ctx.pilot_output_enabled = true;
+        reset_pilot_phases();
+        drive_next_sample_internal();
+        start_pilot_timer();
+        printf("[dpmzm] pilot output -> continuous\r\n");
+    } else if (strcmp(arg, "off") == 0) {
+        s_dpmzm_ctx.pilot_output_enabled = false;
+        stop_pilot_timer();
+        reset_pilot_phases();
+        (void)apply_biases();
+        printf("[dpmzm] pilot output -> scan-only\r\n");
+    } else {
+        printf("[dpmzm] usage: set pilot-open on|off\r\n");
+    }
 }
 
 static void handle_set_bias(const char *cmd)
@@ -169,6 +300,9 @@ static void handle_set_pilot_src(const char *cmd)
 
     if (strcmp(arg, "onboard") == 0) {
         s_dpmzm_ctx.config->pilot_source = DPMZM_PILOT_SOURCE_ONBOARD;
+        if (s_dpmzm_ctx.pilot_output_enabled) {
+            start_pilot_timer();
+        }
     } else if (strcmp(arg, "external") == 0) {
         printf("[dpmzm] external pilot source is reserved but disabled in the current plan\r\n");
         printf("[dpmzm] use onboard DAC-generated pilots\r\n");
@@ -232,12 +366,14 @@ static void handle_set_pilot(const char *cmd)
     case 'i':
         s_dpmzm_ctx.config->pilot_i_freq_hz = freq_hz;
         s_dpmzm_ctx.config->pilot_i_amp_v = mvpp / 2000.0f;
+        reset_pilot_phases();
         printf("[dpmzm] pilot I -> %.1f Hz, %.1f mVpp\r\n",
                (double)freq_hz, (double)mvpp);
         break;
     case 'q':
         s_dpmzm_ctx.config->pilot_q_freq_hz = freq_hz;
         s_dpmzm_ctx.config->pilot_q_amp_v = mvpp / 2000.0f;
+        reset_pilot_phases();
         printf("[dpmzm] pilot Q -> %.1f Hz, %.1f mVpp\r\n",
                (double)freq_hz, (double)mvpp);
         break;
@@ -373,8 +509,12 @@ static void handle_scan_placeholder(const char *cmd)
            (double)req.step_v,
            blocks);
 
+    stop_pilot_timer();
     ok = dpmzm_scan_run(&req, &summary);
     (void)apply_biases();
+    if (s_dpmzm_ctx.pilot_output_enabled) {
+        start_pilot_timer();
+    }
     if (!ok) {
         printf("[dpmzm] scan failed\r\n");
         return;
@@ -393,12 +533,15 @@ void app_dpmzm_init(void)
     s_dpmzm_ctx.bias_i_v = s_dpmzm_ctx.config->bias_i_initial_v;
     s_dpmzm_ctx.bias_q_v = s_dpmzm_ctx.config->bias_q_initial_v;
     s_dpmzm_ctx.bias_p_v = s_dpmzm_ctx.config->bias_p_initial_v;
+    s_dpmzm_ctx.pilot_output_enabled = false;
+    reset_pilot_phases();
+    s_pilot_timer_running = false;
     s_dpmzm_ctx.initialized = true;
 }
 
 void app_dpmzm_run(void)
 {
-    /* Placeholder: no background work in the first open-loop version. */
+    /* Continuous pilot output is driven by TIM6 interrupt. */
 }
 
 const app_dpmzm_context_t *app_dpmzm_get_context(void)
@@ -422,6 +565,8 @@ void app_dpmzm_handle_command(const char *cmd)
         handle_set_bias(cmd);
     } else if (strncmp(cmd, "set pilot-src ", 14) == 0) {
         handle_set_pilot_src(cmd);
+    } else if (strncmp(cmd, "set pilot-open ", 15) == 0) {
+        handle_set_pilot_open(cmd);
     } else if (strncmp(cmd, "set pilot ", 10) == 0) {
         handle_set_pilot(cmd);
     } else if (strncmp(cmd, "set dump ", 9) == 0) {
@@ -432,5 +577,28 @@ void app_dpmzm_handle_command(const char *cmd)
         handle_scan_placeholder(cmd);
     } else {
         printf("[dpmzm] unknown command: %s\r\n", cmd);
+    }
+}
+
+bool app_dpmzm_pilot_output_active(void)
+{
+    return s_dpmzm_ctx.initialized &&
+           s_dpmzm_ctx.pilot_output_enabled &&
+           s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD;
+}
+
+void app_dpmzm_drive_next_sample(void)
+{
+    drive_next_sample_internal();
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim == NULL) {
+        return;
+    }
+
+    if (htim->Instance == TIM6) {
+        drive_next_sample_internal();
     }
 }
