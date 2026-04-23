@@ -1,6 +1,7 @@
 #include "app_main_dpmzm.h"
 #include "dsp_types.h"
 #include "ctrl_scan_dpmzm.h"
+#include "drv_ads131m02.h"
 #include "drv_board.h"
 #include "drv_dac8568.h"
 #include "spi.h"
@@ -28,6 +29,9 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_PILOT_LUT_SIZE            1024U
 #define DPMZM_PILOT_DMA_MAX_FRAMES      3U
 #define DPMZM_PILOT_DAC_FRAME_BYTES     4U
+#define DPMZM_CAPTURE_SAMPLES_MAX       8192U
+#define DPMZM_CAPTURE_SETTLE_DEFAULT_MS 20U
+#define DPMZM_CAPTURE_DRDY_TIMEOUT_MS   5U
 
 /*
  * TIM6 is configured for an exact 16 kHz update rate. The continuous pilot
@@ -50,11 +54,19 @@ static volatile bool s_pilot_dma_contains_p = false;
 static float s_pilot_dma_pending_p_v = 0.0f;
 static volatile uint32_t s_pilot_dma_drop_count = 0U;
 static volatile uint32_t s_pilot_dma_error_count = 0U;
+static bool s_capture_pilot_active = false;
+
+typedef struct {
+    int32_t ch0_code;
+    int32_t ch1_code;
+} dpmzm_capture_sample_t;
+
+static dpmzm_capture_sample_t s_capture_samples[DPMZM_CAPTURE_SAMPLES_MAX];
 
 static bool pilot_generation_active_internal(void)
 {
     return s_dpmzm_ctx.initialized &&
-           (s_dpmzm_ctx.pilot_output_enabled || s_scan_pilot_active) &&
+           (s_dpmzm_ctx.pilot_output_enabled || s_scan_pilot_active || s_capture_pilot_active) &&
            s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD;
 }
 
@@ -352,13 +364,26 @@ static bool start_pilot_timer(void)
     }
 
     init_pilot_lut_once();
+
+    if (s_pilot_timer_running) {
+        __HAL_TIM_SET_COUNTER(&htim6, 0U);
+        __HAL_TIM_CLEAR_FLAG(&htim6, TIM_FLAG_UPDATE);
+        return true;
+    }
+
+    if (htim6.State != HAL_TIM_STATE_READY) {
+        (void)HAL_TIM_Base_Stop_IT(&htim6);
+    }
+
     __HAL_TIM_SET_COUNTER(&htim6, 0U);
+    __HAL_TIM_CLEAR_FLAG(&htim6, TIM_FLAG_UPDATE);
     if (HAL_TIM_Base_Start_IT(&htim6) == HAL_OK) {
         s_pilot_timer_running = true;
         return true;
     } else {
         s_pilot_timer_running = false;
-        printf("[dpmzm] WARN: failed to start TIM6 pilot timer\r\n");
+        printf("[dpmzm] WARN: failed to start TIM6 pilot timer (state=%lu)\r\n",
+               (unsigned long)htim6.State);
         return false;
     }
 }
@@ -483,6 +508,11 @@ static bool parse_float_arg(const char *text, float *value_out)
 
 static void print_status(void)
 {
+    const char *pilot_output_mode =
+        s_dpmzm_ctx.pilot_output_enabled
+            ? (s_pilot_timer_running ? "continuous" : "continuous-failed")
+            : "scan-only";
+
     printf("[dpmzm] status\r\n");
     printf("  initialized: %s\r\n", s_dpmzm_ctx.initialized ? "yes" : "no");
     printf("  bias channels: I=%u Q=%u P=%u\r\n",
@@ -496,7 +526,10 @@ static void print_status(void)
     printf("  pilot source:  %s\r\n",
            pilot_source_name(s_dpmzm_ctx.config->pilot_source));
     printf("  pilot output:  %s\r\n",
-           s_dpmzm_ctx.pilot_output_enabled ? "continuous" : "scan-only");
+           pilot_output_mode);
+    printf("  pilot timer:   %s, tim6_state=%lu\r\n",
+           s_pilot_timer_running ? "running" : "stopped",
+           (unsigned long)htim6.State);
     printf("  pilot I:       %.1f Hz, %.1f mVpp\r\n",
            (double)s_dpmzm_ctx.config->pilot_i_freq_hz,
            (double)(s_dpmzm_ctx.config->pilot_i_amp_v * 2000.0f));
@@ -521,7 +554,13 @@ static void handle_set_pilot_open(const char *cmd)
         s_dpmzm_ctx.pilot_output_enabled = true;
         reset_pilot_phases();
         drive_next_sample_internal();
-        (void)start_pilot_timer();
+        if (!start_pilot_timer()) {
+            s_dpmzm_ctx.pilot_output_enabled = false;
+            reset_pilot_phases();
+            (void)apply_biases();
+            printf("[dpmzm] ERROR: pilot output failed to start\r\n");
+            return;
+        }
         printf("[dpmzm] pilot output -> continuous\r\n");
     } else if (strcmp(arg, "off") == 0) {
         s_dpmzm_ctx.pilot_output_enabled = false;
@@ -813,6 +852,216 @@ static void handle_scan_placeholder(const char *cmd)
            (double)summary.best_metric_value);
 }
 
+static bool wait_and_read_capture_sample(ads131m02_sample_t *sample_out)
+{
+    uint32_t t0;
+
+    if (sample_out == NULL) {
+        return false;
+    }
+
+    t0 = HAL_GetTick();
+    while (board_adc_drdy_read() != 0U) {
+        if ((HAL_GetTick() - t0) > DPMZM_CAPTURE_DRDY_TIMEOUT_MS) {
+            return false;
+        }
+    }
+
+    if (ads131m02_read_sample(sample_out) != 0 || !sample_out->valid) {
+        return false;
+    }
+
+    return true;
+}
+
+static void print_capture_raw_line(uint32_t sample_index,
+                                   float bias_i_v,
+                                   float bias_q_v,
+                                   float bias_p_v,
+                                   const char *pilot_output_mode,
+                                   const dpmzm_capture_sample_t *sample)
+{
+    float ch0_v;
+    float ch1_v;
+
+    if (sample == NULL) {
+        return;
+    }
+
+    ch0_v = ads131m02_code_to_voltage(sample->ch0_code, ADS131M02_GAIN_1);
+    ch1_v = ads131m02_code_to_voltage(sample->ch1_code, ADS131M02_GAIN_1);
+
+    printf("DPMZMCAPTURE,raw,%lu,%ld,%ld,%.9f,%.9f,%u,%.6f,%.6f,%.6f,%s,%s\r\n",
+           (unsigned long)sample_index,
+           (long)sample->ch0_code,
+           (long)sample->ch1_code,
+           (double)ch0_v,
+           (double)ch1_v,
+           (unsigned)DSP_SAMPLE_RATE_HZ,
+           (double)bias_i_v,
+           (double)bias_q_v,
+           (double)bias_p_v,
+           pilot_source_name(s_dpmzm_ctx.config->pilot_source),
+           pilot_output_mode);
+}
+
+static bool capture_begin_onboard_pilot(bool *temporary_pilot_started)
+{
+    if (temporary_pilot_started == NULL) {
+        return false;
+    }
+
+    *temporary_pilot_started = false;
+
+    if (s_dpmzm_ctx.config->pilot_source != DPMZM_PILOT_SOURCE_ONBOARD) {
+        return true;
+    }
+
+    if (s_dpmzm_ctx.pilot_output_enabled) {
+        if (!s_pilot_timer_running) {
+            reset_pilot_phases();
+            (void)apply_current_drive();
+            if (!start_pilot_timer()) {
+                (void)apply_biases();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    stop_pilot_timer();
+    s_capture_pilot_active = true;
+    reset_pilot_phases();
+    (void)apply_current_drive();
+    if (!start_pilot_timer()) {
+        s_capture_pilot_active = false;
+        (void)apply_biases();
+        return false;
+    }
+
+    *temporary_pilot_started = true;
+    return true;
+}
+
+static void capture_end_onboard_pilot(bool temporary_pilot_started)
+{
+    if (!temporary_pilot_started) {
+        return;
+    }
+
+    stop_pilot_timer();
+    s_capture_pilot_active = false;
+    reset_pilot_phases();
+    (void)apply_biases();
+}
+
+static void handle_capture_raw(const char *cmd)
+{
+    const char *args = cmd + strlen("capture raw ");
+    char *endptr = NULL;
+    unsigned long requested_samples = 0UL;
+    unsigned long settle_ms = DPMZM_CAPTURE_SETTLE_DEFAULT_MS;
+    bool temporary_pilot_started = false;
+    const char *pilot_output_mode = "scan-only";
+    float bias_i_v;
+    float bias_q_v;
+    float bias_p_v;
+    unsigned long i;
+
+    if (*args == '\0') {
+        printf("[dpmzm] usage: capture raw <samples> [settle_ms]\r\n");
+        return;
+    }
+
+    requested_samples = strtoul(args, &endptr, 10);
+    if (endptr == args || requested_samples == 0UL ||
+        requested_samples > DPMZM_CAPTURE_SAMPLES_MAX) {
+        printf("[dpmzm] samples must be in range 1..%u\r\n",
+               (unsigned)DPMZM_CAPTURE_SAMPLES_MAX);
+        return;
+    }
+
+    while (*endptr == ' ') {
+        endptr++;
+    }
+
+    if (*endptr != '\0') {
+        settle_ms = strtoul(endptr, &endptr, 10);
+        if (settle_ms == 0UL) {
+            printf("[dpmzm] settle_ms must be a positive integer\r\n");
+            return;
+        }
+        while (*endptr == ' ') {
+            endptr++;
+        }
+        if (*endptr != '\0') {
+            printf("[dpmzm] usage: capture raw <samples> [settle_ms]\r\n");
+            return;
+        }
+    }
+
+    bias_i_v = s_dpmzm_ctx.bias_i_v;
+    bias_q_v = s_dpmzm_ctx.bias_q_v;
+    bias_p_v = s_dpmzm_ctx.bias_p_v;
+
+    if (!timer_owns_dac_outputs()) {
+        if (apply_biases() != 0) {
+            printf("[dpmzm] capture failed: could not apply current biases\r\n");
+            return;
+        }
+    }
+
+    if (!capture_begin_onboard_pilot(&temporary_pilot_started)) {
+        printf("[dpmzm] capture failed: onboard pilot start failed\r\n");
+        return;
+    }
+
+    if (s_dpmzm_ctx.pilot_output_enabled) {
+        pilot_output_mode = "continuous";
+    } else if (temporary_pilot_started) {
+        pilot_output_mode = "capture-temp";
+    }
+
+    board_delay_ms((uint32_t)settle_ms);
+    printf("[dpmzm] capture start: samples=%lu settle=%lu ms source=%s mode=%s\r\n",
+           requested_samples,
+           settle_ms,
+           pilot_source_name(s_dpmzm_ctx.config->pilot_source),
+           pilot_output_mode);
+
+    for (i = 0UL; i < requested_samples; i++) {
+        ads131m02_sample_t sample;
+
+        if (!wait_and_read_capture_sample(&sample)) {
+            printf("[dpmzm] capture failed at sample %lu\r\n", i);
+            capture_end_onboard_pilot(temporary_pilot_started);
+            return;
+        }
+
+        s_capture_samples[i].ch0_code = sample.ch0;
+        s_capture_samples[i].ch1_code = sample.ch1;
+    }
+
+    capture_end_onboard_pilot(temporary_pilot_started);
+
+    for (i = 0UL; i < requested_samples; i++) {
+        print_capture_raw_line((uint32_t)i,
+                               bias_i_v,
+                               bias_q_v,
+                               bias_p_v,
+                               pilot_output_mode,
+                               &s_capture_samples[i]);
+    }
+
+    printf("DPMZMCAPSUM,raw,%lu,%.6f,%.6f,%.6f,%s\r\n",
+           requested_samples,
+           (double)bias_i_v,
+           (double)bias_q_v,
+           (double)bias_p_v,
+           pilot_source_name(s_dpmzm_ctx.config->pilot_source));
+    printf("[dpmzm] capture done: samples=%lu\r\n", requested_samples);
+}
+
 void app_dpmzm_init(void)
 {
     app_config_dpmzm_defaults();
@@ -869,6 +1118,8 @@ void app_dpmzm_handle_command(const char *cmd)
         handle_set_pilot(cmd);
     } else if (strncmp(cmd, "set dump ", 9) == 0) {
         handle_set_dump(cmd);
+    } else if (strncmp(cmd, "capture raw ", 12) == 0) {
+        handle_capture_raw(cmd);
     } else if (strncmp(cmd, "scan matp ", 10) == 0 ||
                strncmp(cmd, "scan qtp ", 9) == 0 ||
                strncmp(cmd, "scan mitp ", 10) == 0) {
@@ -980,7 +1231,12 @@ void app_dpmzm_scan_end(void)
     restore_scan_biases_to_context();
     (void)apply_biases();
     if (s_dpmzm_ctx.pilot_output_enabled) {
-        (void)start_pilot_timer();
+        if (!start_pilot_timer()) {
+            s_dpmzm_ctx.pilot_output_enabled = false;
+            reset_pilot_phases();
+            (void)apply_biases();
+            printf("[dpmzm] WARN: failed to restore continuous pilot after scan\r\n");
+        }
     }
 }
 
