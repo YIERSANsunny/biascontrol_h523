@@ -267,6 +267,7 @@ int ads131m02_init(void)
      *   = OSR 4096 = 2 kSPS), which was wrong.  Corrected to OSR_128 (0x00)
      *   after empirical verification with a 1 kHz sine wave.
      */
+    /* Correct data-rate mapping: OSR=128 in HR mode gives 32 kSPS at 8.192 MHz CLKIN. */
     uint16_t clock_val = ADS131M02_CLK_CH0_EN | ADS131M02_CLK_CH1_EN |
                          ADS131M02_CLK_PWR_HR | ADS131M02_CLK_OSR_128;
     ret = ads131m02_write_reg(ADS131M02_REG_CLOCK, clock_val);
@@ -281,7 +282,7 @@ int ads131m02_init(void)
         return ret;
     }
 
-    printf("[adc] configured: OSR=128, GAIN=1, 64kSPS\r\n");
+    printf("[adc] configured: OSR=128, GAIN=1, 32kSPS\r\n");
     return 0;
 }
 

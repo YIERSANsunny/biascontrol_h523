@@ -12,6 +12,7 @@
 #endif
 
 #define DPMZM_SCAN_DRDY_TIMEOUT_MS 5U
+#define DPMZM_SCAN_DISCARD_BLOCKS_AFTER_SETTLE 1U
 
 typedef struct {
     float phase_rad;
@@ -200,6 +201,22 @@ static bool wait_and_read_sample(float *sample_ac_v, float *sample_dc_v)
     return true;
 }
 
+static bool discard_settle_samples(uint32_t sample_count)
+{
+    uint32_t i;
+
+    for (i = 0; i < sample_count; i++) {
+        float sample_ac_v = 0.0f;
+        float sample_dc_v = 0.0f;
+
+        if (!wait_and_read_sample(&sample_ac_v, &sample_dc_v)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static int apply_bias_triplet(uint8_t ch_i,
                               uint8_t ch_q,
                               uint8_t ch_p,
@@ -335,6 +352,15 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
     }
 
     board_delay_ms(req->settle_ms);
+    /*
+     * The first coherent block after a bias step can contain DAC/analog/ADC
+     * settling residue. Drop it so each reported scan point is computed from
+     * steady-state samples only.
+     */
+    if (!discard_settle_samples(DSP_GOERTZEL_BLOCK_SIZE *
+                                DPMZM_SCAN_DISCARD_BLOCKS_AFTER_SETTLE)) {
+        return false;
+    }
 
     dpmzm_measure_init(&measure_ctx,
                        req->pilot_i_freq_hz,

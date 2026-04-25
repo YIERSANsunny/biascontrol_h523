@@ -34,16 +34,14 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_CAPTURE_DRDY_TIMEOUT_MS   5U
 
 /*
- * TIM6 is configured for an exact 16 kHz update rate. The continuous pilot
- * engine now uses a LUT + SPI1 TX DMA sequence, but 16 kHz still leaves ample
- * headroom for three framed DAC updates (optional P plus I/Q) per sample while
- * providing enough points per cycle for 1 kHz / 1.2 kHz observation.
+ * The pilot phase accumulator must use TIM6's actual update rate. A hardcoded
+ * 16 kHz assumption caused 1 kHz / 1.2 kHz pilots to shift when the MCU clock
+ * tree produced a different TIM6 input clock.
  */
-#define DPMZM_PILOT_TIM6_PSC           124U
-#define DPMZM_PILOT_TIM6_ARR           124U
-#define DPMZM_PILOT_TIM6_RATE_HZ       16000.0f
+#define DPMZM_PILOT_TIM6_RATE_FALLBACK_HZ 16000.0f
 
 static bool s_pilot_timer_running = false;
+static volatile float s_pilot_timer_rate_hz = DPMZM_PILOT_TIM6_RATE_FALLBACK_HZ;
 static bool s_pilot_lut_ready = false;
 static float s_pilot_lut[DPMZM_PILOT_LUT_SIZE + 1U];
 static uint8_t s_pilot_dma_frames[DPMZM_PILOT_DMA_MAX_FRAMES][DPMZM_PILOT_DAC_FRAME_BYTES];
@@ -55,6 +53,8 @@ static float s_pilot_dma_pending_p_v = 0.0f;
 static volatile uint32_t s_pilot_dma_drop_count = 0U;
 static volatile uint32_t s_pilot_dma_error_count = 0U;
 static bool s_capture_pilot_active = false;
+static bool s_scan_reused_continuous_pilot = false;
+static bool s_scan_started_temporary_pilot = false;
 
 typedef struct {
     int32_t ch0_code;
@@ -73,6 +73,33 @@ static bool pilot_generation_active_internal(void)
 static bool timer_owns_dac_outputs(void)
 {
     return s_pilot_timer_running && pilot_generation_active_internal();
+}
+
+static float compute_tim6_update_rate_hz(void)
+{
+    RCC_ClkInitTypeDef clock_config;
+    uint32_t flash_latency = 0U;
+    uint32_t pclk1_hz = HAL_RCC_GetPCLK1Freq();
+    uint32_t tim6_clk_hz = pclk1_hz;
+    uint32_t prescaler_div = htim6.Init.Prescaler + 1U;
+    uint32_t period_div = htim6.Init.Period + 1U;
+
+    HAL_RCC_GetClockConfig(&clock_config, &flash_latency);
+    if (clock_config.APB1CLKDivider != RCC_HCLK_DIV1) {
+        tim6_clk_hz = pclk1_hz * 2U;
+    }
+
+    if (tim6_clk_hz == 0U || prescaler_div == 0U || period_div == 0U) {
+        return DPMZM_PILOT_TIM6_RATE_FALLBACK_HZ;
+    }
+
+    return (float)((double)tim6_clk_hz /
+                   ((double)prescaler_div * (double)period_div));
+}
+
+static void refresh_pilot_timer_rate(void)
+{
+    s_pilot_timer_rate_hz = compute_tim6_update_rate_hz();
 }
 
 static void init_pilot_lut_once(void)
@@ -364,6 +391,7 @@ static bool start_pilot_timer(void)
     }
 
     init_pilot_lut_once();
+    refresh_pilot_timer_rate();
 
     if (s_pilot_timer_running) {
         __HAL_TIM_SET_COUNTER(&htim6, 0U);
@@ -462,6 +490,7 @@ static void drive_next_sample_internal(void)
 {
     float tone_i_v = 0.0f;
     float tone_q_v = 0.0f;
+    float timer_rate_hz = s_pilot_timer_rate_hz;
     float phase_step_i;
     float phase_step_q;
     float pending_p_v = 0.0f;
@@ -469,6 +498,10 @@ static void drive_next_sample_internal(void)
 
     if (!pilot_generation_active_internal()) {
         return;
+    }
+
+    if (timer_rate_hz <= 0.0f) {
+        timer_rate_hz = DPMZM_PILOT_TIM6_RATE_FALLBACK_HZ;
     }
 
     include_p_frame = consume_pending_p_bias(&pending_p_v);
@@ -479,9 +512,9 @@ static void drive_next_sample_internal(void)
     }
 
     phase_step_i = (2.0f * M_PI * s_dpmzm_ctx.config->pilot_i_freq_hz) /
-                   DPMZM_PILOT_TIM6_RATE_HZ;
+                   timer_rate_hz;
     phase_step_q = (2.0f * M_PI * s_dpmzm_ctx.config->pilot_q_freq_hz) /
-                   DPMZM_PILOT_TIM6_RATE_HZ;
+                   timer_rate_hz;
     s_pilot_i_phase_rad += phase_step_i;
     s_pilot_q_phase_rad += phase_step_q;
     wrap_phase(&s_pilot_i_phase_rad);
@@ -512,6 +545,9 @@ static void print_status(void)
         s_dpmzm_ctx.pilot_output_enabled
             ? (s_pilot_timer_running ? "continuous" : "continuous-failed")
             : "scan-only";
+    float pilot_timer_rate_hz = compute_tim6_update_rate_hz();
+
+    s_pilot_timer_rate_hz = pilot_timer_rate_hz;
 
     printf("[dpmzm] status\r\n");
     printf("  initialized: %s\r\n", s_dpmzm_ctx.initialized ? "yes" : "no");
@@ -530,6 +566,8 @@ static void print_status(void)
     printf("  pilot timer:   %s, tim6_state=%lu\r\n",
            s_pilot_timer_running ? "running" : "stopped",
            (unsigned long)htim6.State);
+    printf("  pilot tim6 fs: %.2f Hz\r\n",
+           (double)pilot_timer_rate_hz);
     printf("  pilot I:       %.1f Hz, %.1f mVpp\r\n",
            (double)s_dpmzm_ctx.config->pilot_i_freq_hz,
            (double)(s_dpmzm_ctx.config->pilot_i_amp_v * 2000.0f));
@@ -1202,21 +1240,38 @@ bool app_dpmzm_scan_begin(bool use_onboard_pilot)
     }
 
     capture_scan_restore_biases();
-    stop_pilot_timer();
     s_scan_pilot_active = false;
+    s_scan_reused_continuous_pilot = false;
+    s_scan_started_temporary_pilot = false;
 
     if (use_onboard_pilot &&
         s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD) {
         s_scan_pilot_active = true;
+
+        /*
+         * If the user already has continuous pilot output enabled, scan should
+         * reuse that exact running waveform. Stopping and restarting the pilot
+         * here changes the experimental condition compared with fixed-point
+         * raw capture and can make Goertzel metrics disagree with the raw FFT.
+         */
+        if (s_dpmzm_ctx.pilot_output_enabled && s_pilot_timer_running) {
+            s_scan_reused_continuous_pilot = true;
+            return true;
+        }
+
+        stop_pilot_timer();
         reset_pilot_phases();
         (void)apply_current_drive();
         if (!start_pilot_timer()) {
             s_scan_pilot_active = false;
+            s_scan_reused_continuous_pilot = false;
             restore_scan_biases_to_context();
             (void)apply_biases();
             return false;
         }
+        s_scan_started_temporary_pilot = true;
     } else {
+        stop_pilot_timer();
         (void)apply_biases();
     }
 
@@ -1225,12 +1280,22 @@ bool app_dpmzm_scan_begin(bool use_onboard_pilot)
 
 void app_dpmzm_scan_end(void)
 {
-    stop_pilot_timer();
+    bool reused_continuous = s_scan_reused_continuous_pilot;
+
+    if (!reused_continuous || s_scan_started_temporary_pilot) {
+        stop_pilot_timer();
+    }
     s_scan_pilot_active = false;
+    s_scan_reused_continuous_pilot = false;
+    s_scan_started_temporary_pilot = false;
     reset_pilot_phases();
     restore_scan_biases_to_context();
-    (void)apply_biases();
-    if (s_dpmzm_ctx.pilot_output_enabled) {
+    if (reused_continuous && s_dpmzm_ctx.pilot_output_enabled && s_pilot_timer_running) {
+        requeue_pending_p_bias(s_dpmzm_ctx.bias_p_v);
+    } else {
+        (void)apply_biases();
+    }
+    if (!reused_continuous && s_dpmzm_ctx.pilot_output_enabled) {
         if (!start_pilot_timer()) {
             s_dpmzm_ctx.pilot_output_enabled = false;
             reset_pilot_phases();
