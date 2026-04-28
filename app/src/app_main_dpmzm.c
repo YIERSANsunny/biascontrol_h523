@@ -908,6 +908,32 @@ static void handle_auto_status(void)
     dpmzm_auto_print_status();
 }
 
+static void fill_auto_scan_template(dpmzm_scan_request_t *scan_template)
+{
+    if (scan_template == NULL) {
+        return;
+    }
+
+    memset(scan_template, 0, sizeof(*scan_template));
+    scan_template->blocks = s_dpmzm_ctx.config->scan_default_blocks;
+    scan_template->settle_ms = 2U;
+    scan_template->bias_i_v = s_dpmzm_ctx.bias_i_v;
+    scan_template->bias_q_v = s_dpmzm_ctx.bias_q_v;
+    scan_template->bias_p_v = s_dpmzm_ctx.bias_p_v;
+    scan_template->bias_i_dac_channel = s_dpmzm_ctx.config->bias_i_dac_channel;
+    scan_template->bias_q_dac_channel = s_dpmzm_ctx.config->bias_q_dac_channel;
+    scan_template->bias_p_dac_channel = s_dpmzm_ctx.config->bias_p_dac_channel;
+    scan_template->pilot_i_freq_hz = s_dpmzm_ctx.config->pilot_i_freq_hz;
+    scan_template->pilot_q_freq_hz = s_dpmzm_ctx.config->pilot_q_freq_hz;
+    scan_template->pilot_i_amp_v = s_dpmzm_ctx.config->pilot_i_amp_v;
+    scan_template->pilot_q_amp_v = s_dpmzm_ctx.config->pilot_q_amp_v;
+    scan_template->pilot_mode = to_scan_pilot_mode(s_dpmzm_ctx.config->pilot_source);
+    scan_template->dump_mode = to_scan_dump_mode(s_dpmzm_ctx.config->dump_mode);
+    scan_template->continuous_onboard_pilot =
+        (scan_template->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD);
+    scan_template->bias_apply_fn = app_dpmzm_scan_apply_bias_triplet;
+}
+
 static void handle_auto_coarse(void)
 {
     dpmzm_auto_coarse_request_t req;
@@ -921,23 +947,7 @@ static void handle_auto_coarse(void)
     req.sweep_min_v = -9.0f;
     req.sweep_max_v = 9.0f;
     req.sweep_step_v = 0.1f;
-    req.scan_template.blocks = s_dpmzm_ctx.config->scan_default_blocks;
-    req.scan_template.settle_ms = 2U;
-    req.scan_template.bias_i_v = s_dpmzm_ctx.bias_i_v;
-    req.scan_template.bias_q_v = s_dpmzm_ctx.bias_q_v;
-    req.scan_template.bias_p_v = s_dpmzm_ctx.bias_p_v;
-    req.scan_template.bias_i_dac_channel = s_dpmzm_ctx.config->bias_i_dac_channel;
-    req.scan_template.bias_q_dac_channel = s_dpmzm_ctx.config->bias_q_dac_channel;
-    req.scan_template.bias_p_dac_channel = s_dpmzm_ctx.config->bias_p_dac_channel;
-    req.scan_template.pilot_i_freq_hz = s_dpmzm_ctx.config->pilot_i_freq_hz;
-    req.scan_template.pilot_q_freq_hz = s_dpmzm_ctx.config->pilot_q_freq_hz;
-    req.scan_template.pilot_i_amp_v = s_dpmzm_ctx.config->pilot_i_amp_v;
-    req.scan_template.pilot_q_amp_v = s_dpmzm_ctx.config->pilot_q_amp_v;
-    req.scan_template.pilot_mode = to_scan_pilot_mode(s_dpmzm_ctx.config->pilot_source);
-    req.scan_template.dump_mode = to_scan_dump_mode(s_dpmzm_ctx.config->dump_mode);
-    req.scan_template.continuous_onboard_pilot =
-        (req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD);
-    req.scan_template.bias_apply_fn = app_dpmzm_scan_apply_bias_triplet;
+    fill_auto_scan_template(&req.scan_template);
 
     printf("[dpmzm][auto] coarse start: range=%+.1f..%+.1fV step=%.3f blocks=%lu\r\n",
            (double)req.sweep_min_v,
@@ -966,6 +976,69 @@ static void handle_auto_coarse(void)
            (double)result.i_mitp_coarse_v,
            (double)result.q_mitp_coarse_v,
            (double)result.p_qtp_coarse_v,
+           apply_ret);
+}
+
+static void handle_auto_fine(void)
+{
+    const dpmzm_auto_context_t *auto_ctx = dpmzm_auto_get_context();
+    dpmzm_auto_fine_request_t req;
+    dpmzm_auto_fine_result_t result;
+    bool ok;
+    int apply_ret = 0;
+
+    memset(&req, 0, sizeof(req));
+    memset(&result, 0, sizeof(result));
+
+    if (auto_ctx == NULL || !auto_ctx->has_result ||
+        auto_ctx->last_result.error != DPMZM_AUTO_OK ||
+        !auto_ctx->last_result.p_qtp_valid ||
+        !auto_ctx->last_result.i_mitp_valid ||
+        !auto_ctx->last_result.q_mitp_valid) {
+        printf("[dpmzm][auto] fine refused: run 'dpmzm auto coarse' first\r\n");
+        return;
+    }
+
+    fill_auto_scan_template(&req.scan_template);
+    req.coarse_result = auto_ctx->last_result;
+    req.sweep_min_v = -9.0f;
+    req.sweep_max_v = 9.0f;
+    req.wide_range_v = 2.0f;
+    req.wide_step_v = 0.05f;
+    req.p_fine_range_v = 0.6f;
+    req.iq_fine_range_v = 0.6f;
+    req.expanded_range_v = 1.0f;
+    req.fine_step_v = 0.01f;
+
+    printf("[dpmzm][auto] fine start: wide=+/-%0.2fV step=%.3f fineP=+/-%0.2fV fineIQ=+/-%0.2fV step=%.3f blocks=%lu\r\n",
+           (double)req.wide_range_v,
+           (double)req.wide_step_v,
+           (double)req.p_fine_range_v,
+           (double)req.iq_fine_range_v,
+           (double)req.fine_step_v,
+           (unsigned long)req.scan_template.blocks);
+
+    if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
+        printf("[dpmzm][auto] fine failed: onboard pilot start failed\r\n");
+        return;
+    }
+
+    ok = dpmzm_auto_run_fine(&req, &result);
+    app_dpmzm_scan_end();
+
+    dpmzm_auto_print_fine_result(&result);
+    if (!ok) {
+        printf("[dpmzm][auto] fine failed\r\n");
+        return;
+    }
+
+    apply_ret = app_dpmzm_scan_apply_bias_triplet(result.i_mitp_fine_v,
+                                                  result.q_mitp_fine_v,
+                                                  result.p_qtp_fine_v);
+    printf("[dpmzm][auto] applied fine result: I=%+.3fV Q=%+.3fV P=%+.3fV (ret=%d)\r\n",
+           (double)result.i_mitp_fine_v,
+           (double)result.q_mitp_fine_v,
+           (double)result.p_qtp_fine_v,
            apply_ret);
 }
 
@@ -1253,6 +1326,8 @@ void app_dpmzm_handle_command(const char *cmd)
         handle_capture_raw(cmd);
     } else if (strcmp(cmd, "auto coarse") == 0) {
         handle_auto_coarse();
+    } else if (strcmp(cmd, "auto fine") == 0) {
+        handle_auto_fine();
     } else if (strcmp(cmd, "auto status") == 0) {
         handle_auto_status();
     } else if (strncmp(cmd, "scan matp ", 10) == 0 ||

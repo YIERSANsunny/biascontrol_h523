@@ -37,6 +37,18 @@ static const char *auto_state_name(dpmzm_auto_state_t state)
         return "SCAN_I_MITP";
     case DPMZM_AUTO_SCAN_Q_MITP:
         return "SCAN_Q_MITP";
+    case DPMZM_AUTO_FINE_SCAN_P_WIDE:
+        return "FINE_SCAN_P_WIDE";
+    case DPMZM_AUTO_FINE_SCAN_P_FINE:
+        return "FINE_SCAN_P_FINE";
+    case DPMZM_AUTO_FINE_SCAN_I_WIDE:
+        return "FINE_SCAN_I_WIDE";
+    case DPMZM_AUTO_FINE_SCAN_I_FINE:
+        return "FINE_SCAN_I_FINE";
+    case DPMZM_AUTO_FINE_SCAN_Q_WIDE:
+        return "FINE_SCAN_Q_WIDE";
+    case DPMZM_AUTO_FINE_SCAN_Q_FINE:
+        return "FINE_SCAN_Q_FINE";
     case DPMZM_AUTO_DONE:
         return "DONE";
     case DPMZM_AUTO_FAILED:
@@ -67,6 +79,10 @@ static const char *auto_error_name(dpmzm_auto_error_t error)
         return "I_MITP_NOT_FOUND";
     case DPMZM_AUTO_ERR_Q_MITP_NOT_FOUND:
         return "Q_MITP_NOT_FOUND";
+    case DPMZM_AUTO_ERR_NO_COARSE_RESULT:
+        return "NO_COARSE_RESULT";
+    case DPMZM_AUTO_ERR_NEED_WIDER_WINDOW:
+        return "NEED_WIDER_WINDOW";
     case DPMZM_AUTO_ERR_SCAN_EXECUTION:
         return "SCAN_EXECUTION";
     default:
@@ -160,6 +176,16 @@ static void reset_result(dpmzm_auto_coarse_result_t *result)
     result->error = DPMZM_AUTO_OK;
 }
 
+static void reset_fine_result(dpmzm_auto_fine_result_t *result)
+{
+    if (result == NULL) {
+        return;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->error = DPMZM_AUTO_OK;
+}
+
 static void clear_context(void)
 {
     memset(&s_auto_ctx, 0, sizeof(s_auto_ctx));
@@ -181,6 +207,52 @@ static bool request_valid(const dpmzm_auto_coarse_request_t *req)
     if (expected_point_count(req->sweep_min_v,
                              req->sweep_max_v,
                              req->sweep_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
+        return false;
+    }
+    return true;
+}
+
+static bool fine_request_valid(const dpmzm_auto_fine_request_t *req)
+{
+    if (req == NULL) {
+        return false;
+    }
+    if (req->wide_step_v == 0.0f || req->fine_step_v == 0.0f) {
+        return false;
+    }
+    if (req->wide_range_v <= 0.0f ||
+        req->p_fine_range_v <= 0.0f ||
+        req->iq_fine_range_v <= 0.0f ||
+        req->expanded_range_v <= 0.0f) {
+        return false;
+    }
+    if (req->scan_template.blocks == 0U) {
+        return false;
+    }
+    if (!req->coarse_result.p_qtp_valid ||
+        !req->coarse_result.i_mitp_valid ||
+        !req->coarse_result.q_mitp_valid ||
+        req->coarse_result.error != DPMZM_AUTO_OK) {
+        return false;
+    }
+    if (expected_point_count(-req->wide_range_v,
+                             req->wide_range_v,
+                             req->wide_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
+        return false;
+    }
+    if (expected_point_count(-req->expanded_range_v,
+                             req->expanded_range_v,
+                             req->fine_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
+        return false;
+    }
+    if (expected_point_count(-req->p_fine_range_v,
+                             req->p_fine_range_v,
+                             req->fine_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
+        return false;
+    }
+    if (expected_point_count(-req->iq_fine_range_v,
+                             req->iq_fine_range_v,
+                             req->fine_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
         return false;
     }
     return true;
@@ -850,6 +922,172 @@ static bool run_collect_scan(dpmzm_scan_request_t *scan_req,
                                   point_count_out);
 }
 
+static float clamp_bias(float value, float min_v, float max_v)
+{
+    if (value < min_v) {
+        return min_v;
+    }
+    if (value > max_v) {
+        return max_v;
+    }
+    return value;
+}
+
+static void build_scan_window(float center_v,
+                              float range_v,
+                              float min_v,
+                              float max_v,
+                              float *start_v,
+                              float *stop_v)
+{
+    if (start_v == NULL || stop_v == NULL) {
+        return;
+    }
+
+    *start_v = clamp_bias(center_v - fabsf(range_v), min_v, max_v);
+    *stop_v = clamp_bias(center_v + fabsf(range_v), min_v, max_v);
+}
+
+static bool pick_best_point(dpmzm_scan_stage_t stage,
+                            dpmzm_scan_target_t target,
+                            const dpmzm_scan_point_t *points,
+                            uint32_t point_count,
+                            float *best_bias_v,
+                            float *best_metric_dbm,
+                            uint32_t *best_index_out)
+{
+    float best_metric = FLT_MAX;
+    float best_bias = 0.0f;
+    uint32_t best_index = 0U;
+    uint32_t i;
+
+    if (points == NULL || point_count == 0U || best_bias_v == NULL) {
+        return false;
+    }
+
+    for (i = 0U; i < point_count; i++) {
+        float metric = metric_dbm_from_point(stage, target, &points[i]);
+        if (metric < best_metric) {
+            best_metric = metric;
+            best_bias = points[i].sweep_v;
+            best_index = i;
+        }
+    }
+
+    *best_bias_v = best_bias;
+    if (best_metric_dbm != NULL) {
+        *best_metric_dbm = best_metric;
+    }
+    if (best_index_out != NULL) {
+        *best_index_out = best_index;
+    }
+    return true;
+}
+
+static bool best_point_near_edge(const dpmzm_scan_point_t *points,
+                                 uint32_t point_count,
+                                 uint32_t best_index,
+                                 float step_v)
+{
+    float edge_margin;
+    float best_v;
+    float left_v;
+    float right_v;
+
+    if (points == NULL || point_count == 0U || best_index >= point_count) {
+        return false;
+    }
+
+    edge_margin = fmaxf(2.0f * fabsf(step_v), 0.05f);
+    best_v = points[best_index].sweep_v;
+    left_v = fminf(points[0].sweep_v, points[point_count - 1U].sweep_v);
+    right_v = fmaxf(points[0].sweep_v, points[point_count - 1U].sweep_v);
+
+    return (fabsf(best_v - left_v) <= edge_margin) ||
+           (fabsf(best_v - right_v) <= edge_margin);
+}
+
+static bool apply_fixed_biases(dpmzm_scan_request_t *scan_req,
+                               float vi,
+                               float vq,
+                               float vp)
+{
+    if (scan_req == NULL) {
+        return false;
+    }
+
+    scan_req->bias_i_v = vi;
+    scan_req->bias_q_v = vq;
+    scan_req->bias_p_v = vp;
+    if (scan_req->bias_apply_fn != NULL) {
+        return scan_req->bias_apply_fn(vi, vq, vp) == 0;
+    }
+    return true;
+}
+
+static bool run_best_window_scan(dpmzm_scan_request_t *scan_req,
+                                 dpmzm_scan_stage_t stage,
+                                 dpmzm_scan_target_t target,
+                                 float center_v,
+                                 float range_v,
+                                 float step_v,
+                                 float min_v,
+                                 float max_v,
+                                 float *best_v,
+                                 bool *edge_out)
+{
+    dpmzm_scan_summary_t summary;
+    float start_v = 0.0f;
+    float stop_v = 0.0f;
+    uint32_t point_count = 0U;
+    uint32_t best_index = 0U;
+    float best_metric_dbm = 0.0f;
+
+    if (scan_req == NULL || best_v == NULL) {
+        return false;
+    }
+
+    build_scan_window(center_v, range_v, min_v, max_v, &start_v, &stop_v);
+    if (!run_collect_scan(scan_req,
+                          stage,
+                          target,
+                          start_v,
+                          stop_v,
+                          step_v,
+                          &summary,
+                          &point_count)) {
+        return false;
+    }
+
+    if (!pick_best_point(stage,
+                         target,
+                         s_scan_points,
+                         point_count,
+                         best_v,
+                         &best_metric_dbm,
+                         &best_index)) {
+        return false;
+    }
+
+    if (edge_out != NULL) {
+        *edge_out = best_point_near_edge(s_scan_points,
+                                         point_count,
+                                         best_index,
+                                         step_v);
+    }
+
+    printf("[dpmzm][auto] fine pick: stage=%s target=%s center=%+.3fV range=%.3f step=%.3f best=%+.3fV %.2fdBm edge=%s\r\n",
+           dpmzm_scan_stage_name(stage),
+           dpmzm_scan_target_name(target),
+           (double)center_v,
+           (double)range_v,
+           (double)step_v,
+           (double)*best_v,
+           (double)best_metric_dbm,
+           (edge_out != NULL && *edge_out) ? "yes" : "no");
+    return true;
+}
+
 static void print_matp_candidates(const char *label,
                                   const dpmzm_matp_candidate_t *candidates,
                                   uint32_t count)
@@ -1107,6 +1345,270 @@ fail:
     return false;
 }
 
+bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
+                         dpmzm_auto_fine_result_t *out)
+{
+    dpmzm_scan_request_t scan_req;
+    dpmzm_auto_fine_result_t result;
+    float i_final = 0.0f;
+    float q_final = 0.0f;
+    float p_final = 0.0f;
+    bool edge = false;
+
+    if (out == NULL) {
+        return false;
+    }
+
+    reset_fine_result(&result);
+    if (req == NULL) {
+        result.error = DPMZM_AUTO_ERR_BAD_ARG;
+        *out = result;
+        return false;
+    }
+    if (!req->coarse_result.p_qtp_valid ||
+        !req->coarse_result.i_mitp_valid ||
+        !req->coarse_result.q_mitp_valid ||
+        req->coarse_result.error != DPMZM_AUTO_OK) {
+        result.error = DPMZM_AUTO_ERR_NO_COARSE_RESULT;
+        s_auto_ctx.error = result.error;
+        s_auto_ctx.last_fine_result = result;
+        s_auto_ctx.has_fine_result = true;
+        *out = result;
+        return false;
+    }
+    if (!fine_request_valid(req)) {
+        result.error = DPMZM_AUTO_ERR_BAD_ARG;
+        s_auto_ctx.error = result.error;
+        s_auto_ctx.last_fine_result = result;
+        s_auto_ctx.has_fine_result = true;
+        *out = result;
+        return false;
+    }
+
+    s_auto_ctx.error = DPMZM_AUTO_OK;
+    s_auto_ctx.has_fine_result = false;
+    memset(&scan_req, 0, sizeof(scan_req));
+    scan_req = req->scan_template;
+
+    i_final = req->coarse_result.i_mitp_coarse_v;
+    q_final = req->coarse_result.q_mitp_coarse_v;
+    p_final = req->coarse_result.p_qtp_coarse_v;
+
+    set_state(DPMZM_AUTO_FINE_SCAN_P_WIDE);
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (!run_best_window_scan(&scan_req,
+                              DPMZM_SCAN_STAGE_QTP,
+                              DPMZM_SCAN_TARGET_P,
+                              p_final,
+                              req->wide_range_v,
+                              req->wide_step_v,
+                              req->sweep_min_v,
+                              req->sweep_max_v,
+                              &result.p_qtp_wide_v,
+                              &edge)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+
+    set_state(DPMZM_AUTO_FINE_SCAN_P_FINE);
+    p_final = result.p_qtp_wide_v;
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (!run_best_window_scan(&scan_req,
+                              DPMZM_SCAN_STAGE_QTP,
+                              DPMZM_SCAN_TARGET_P,
+                              p_final,
+                              req->p_fine_range_v,
+                              req->fine_step_v,
+                              req->sweep_min_v,
+                              req->sweep_max_v,
+                              &result.p_qtp_fine_v,
+                              &edge)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (edge) {
+        result.p_qtp_expanded = true;
+        p_final = result.p_qtp_fine_v;
+        if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+            goto fail;
+        }
+        if (!run_best_window_scan(&scan_req,
+                                  DPMZM_SCAN_STAGE_QTP,
+                                  DPMZM_SCAN_TARGET_P,
+                                  p_final,
+                                  req->expanded_range_v,
+                                  req->fine_step_v,
+                                  req->sweep_min_v,
+                                  req->sweep_max_v,
+                                  &result.p_qtp_fine_v,
+                                  &edge)) {
+            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+            goto fail;
+        }
+        if (edge) {
+            result.error = DPMZM_AUTO_ERR_NEED_WIDER_WINDOW;
+            goto fail;
+        }
+    }
+    p_final = result.p_qtp_fine_v;
+    result.p_qtp_valid = true;
+
+    set_state(DPMZM_AUTO_FINE_SCAN_I_WIDE);
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (!run_best_window_scan(&scan_req,
+                              DPMZM_SCAN_STAGE_MITP,
+                              DPMZM_SCAN_TARGET_I,
+                              i_final,
+                              req->wide_range_v,
+                              req->wide_step_v,
+                              req->sweep_min_v,
+                              req->sweep_max_v,
+                              &result.i_mitp_wide_v,
+                              &edge)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+
+    set_state(DPMZM_AUTO_FINE_SCAN_I_FINE);
+    i_final = result.i_mitp_wide_v;
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (!run_best_window_scan(&scan_req,
+                              DPMZM_SCAN_STAGE_MITP,
+                              DPMZM_SCAN_TARGET_I,
+                              i_final,
+                              req->iq_fine_range_v,
+                              req->fine_step_v,
+                              req->sweep_min_v,
+                              req->sweep_max_v,
+                              &result.i_mitp_fine_v,
+                              &edge)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (edge) {
+        result.i_mitp_expanded = true;
+        i_final = result.i_mitp_fine_v;
+        if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+            goto fail;
+        }
+        if (!run_best_window_scan(&scan_req,
+                                  DPMZM_SCAN_STAGE_MITP,
+                                  DPMZM_SCAN_TARGET_I,
+                                  i_final,
+                                  req->expanded_range_v,
+                                  req->fine_step_v,
+                                  req->sweep_min_v,
+                                  req->sweep_max_v,
+                                  &result.i_mitp_fine_v,
+                                  &edge)) {
+            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+            goto fail;
+        }
+        if (edge) {
+            result.error = DPMZM_AUTO_ERR_NEED_WIDER_WINDOW;
+            goto fail;
+        }
+    }
+    i_final = result.i_mitp_fine_v;
+    result.i_mitp_valid = true;
+
+    set_state(DPMZM_AUTO_FINE_SCAN_Q_WIDE);
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (!run_best_window_scan(&scan_req,
+                              DPMZM_SCAN_STAGE_MITP,
+                              DPMZM_SCAN_TARGET_Q,
+                              q_final,
+                              req->wide_range_v,
+                              req->wide_step_v,
+                              req->sweep_min_v,
+                              req->sweep_max_v,
+                              &result.q_mitp_wide_v,
+                              &edge)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+
+    set_state(DPMZM_AUTO_FINE_SCAN_Q_FINE);
+    q_final = result.q_mitp_wide_v;
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (!run_best_window_scan(&scan_req,
+                              DPMZM_SCAN_STAGE_MITP,
+                              DPMZM_SCAN_TARGET_Q,
+                              q_final,
+                              req->iq_fine_range_v,
+                              req->fine_step_v,
+                              req->sweep_min_v,
+                              req->sweep_max_v,
+                              &result.q_mitp_fine_v,
+                              &edge)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (edge) {
+        result.q_mitp_expanded = true;
+        q_final = result.q_mitp_fine_v;
+        if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+            goto fail;
+        }
+        if (!run_best_window_scan(&scan_req,
+                                  DPMZM_SCAN_STAGE_MITP,
+                                  DPMZM_SCAN_TARGET_Q,
+                                  q_final,
+                                  req->expanded_range_v,
+                                  req->fine_step_v,
+                                  req->sweep_min_v,
+                                  req->sweep_max_v,
+                                  &result.q_mitp_fine_v,
+                                  &edge)) {
+            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+            goto fail;
+        }
+        if (edge) {
+            result.error = DPMZM_AUTO_ERR_NEED_WIDER_WINDOW;
+            goto fail;
+        }
+    }
+    q_final = result.q_mitp_fine_v;
+    result.q_mitp_valid = true;
+
+    set_state(DPMZM_AUTO_DONE);
+    result.error = DPMZM_AUTO_OK;
+    s_auto_ctx.error = DPMZM_AUTO_OK;
+    s_auto_ctx.last_fine_result = result;
+    s_auto_ctx.has_fine_result = true;
+    *out = result;
+    return true;
+
+fail:
+    set_state(DPMZM_AUTO_FAILED);
+    s_auto_ctx.error = result.error;
+    s_auto_ctx.last_fine_result = result;
+    s_auto_ctx.has_fine_result = true;
+    *out = result;
+    return false;
+}
+
 void dpmzm_auto_print_result(const dpmzm_auto_coarse_result_t *result)
 {
     if (result == NULL) {
@@ -1131,6 +1633,32 @@ void dpmzm_auto_print_result(const dpmzm_auto_coarse_result_t *result)
            result->q_mitp_valid ? "valid" : "invalid");
 }
 
+void dpmzm_auto_print_fine_result(const dpmzm_auto_fine_result_t *result)
+{
+    if (result == NULL) {
+        printf("[dpmzm][auto] no fine result\r\n");
+        return;
+    }
+
+    printf("[dpmzm][auto] fine result\r\n");
+    printf("  error:        %s\r\n", auto_error_name(result->error));
+    printf("  P QTP wide:   %+.3fV\r\n", (double)result->p_qtp_wide_v);
+    printf("  P QTP fine:   %+.3fV (%s, expanded=%s)\r\n",
+           (double)result->p_qtp_fine_v,
+           result->p_qtp_valid ? "valid" : "invalid",
+           result->p_qtp_expanded ? "yes" : "no");
+    printf("  I MITP wide:  %+.3fV\r\n", (double)result->i_mitp_wide_v);
+    printf("  I MITP fine:  %+.3fV (%s, expanded=%s)\r\n",
+           (double)result->i_mitp_fine_v,
+           result->i_mitp_valid ? "valid" : "invalid",
+           result->i_mitp_expanded ? "yes" : "no");
+    printf("  Q MITP wide:  %+.3fV\r\n", (double)result->q_mitp_wide_v);
+    printf("  Q MITP fine:  %+.3fV (%s, expanded=%s)\r\n",
+           (double)result->q_mitp_fine_v,
+           result->q_mitp_valid ? "valid" : "invalid",
+           result->q_mitp_expanded ? "yes" : "no");
+}
+
 void dpmzm_auto_print_status(void)
 {
     printf("[dpmzm][auto] status\r\n");
@@ -1140,5 +1668,9 @@ void dpmzm_auto_print_status(void)
     printf("  has_result:    %s\r\n", s_auto_ctx.has_result ? "yes" : "no");
     if (s_auto_ctx.has_result) {
         dpmzm_auto_print_result(&s_auto_ctx.last_result);
+    }
+    printf("  has_fine:      %s\r\n", s_auto_ctx.has_fine_result ? "yes" : "no");
+    if (s_auto_ctx.has_fine_result) {
+        dpmzm_auto_print_fine_result(&s_auto_ctx.last_fine_result);
     }
 }

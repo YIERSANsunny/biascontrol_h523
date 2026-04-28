@@ -12,6 +12,16 @@ Bias scan captures and derived figures are grouped here to keep `docs/` tidy.
 本目录只保留当前控制算法直接相关、可复现结论的最新验证产物。
 中间调参 smoke run、失败试验图、过渡迭代数据不保留在仓库中。
 
+## 当前保留集（DPMZM 自动粗扫 + 自动细扫，2026-04-28）
+
+| 文件 | 说明 |
+|---|---|
+| `2026-04-28-dpmzm-auto-coarse-fine-summary.md` | DPMZM 第二版自动细扫第一轮上板验证总结 |
+| `raw/2026-04-28-auto-coarse-fine/` | 本轮串口日志、汇总 CSV、分段 CSV |
+| `assets/2026-04-28-auto-coarse-fine/` | 本轮 11 段扫描曲线图 |
+
+阶段结论：`dpmzm auto coarse` + `dpmzm auto fine` 完整跑通，最终自动应用 `I=+5.600 V, Q=-6.300 V, P=+1.520 V`，并且该点已经通过光功率计做了定性确认。
+
 ## 当前保留集（spec-04 验收，2026-04-13）
 
 ### 标定扫描（双扫描校准，spec-04 实现验证）
