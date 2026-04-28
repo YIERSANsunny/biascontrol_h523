@@ -64,3 +64,6 @@ PD → TIA(OPA140) → ADS131M02 CH0 → Goertzel(f0, 2f0)
 
 - [spec-06d-dpmzm-status-overview](spec-06d-dpmzm-status-overview.md): DPMZM 总览页，集中说明目标、已实现、未实现、代码入口与下一步
 - [spec-06e-dpmzm-uart-checklist](spec-06e-dpmzm-uart-checklist.md): 明天上板实验时可直接照着执行的 DPMZM 串口命令清单
+- [spec-06f-dpmzm-closed-loop-strategy](spec-06f-dpmzm-closed-loop-strategy.md): 基于现有开环数据整理的 DPMZM 可行控制方案，区分粗捕获、局部细化与真正闭环
+- [spec-06g-dpmzm-v1-implementation-checklist](spec-06g-dpmzm-v1-implementation-checklist.md): 第一版固件实现清单，只聚焦“板上自动粗捕获”
+- [spec-06h-dpmzm-v1-code-change-checklist](spec-06h-dpmzm-v1-code-change-checklist.md): 第一版代码改动清单，明确当前代码库里要改哪些文件、先加哪些结构体和接口

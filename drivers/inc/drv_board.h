@@ -135,9 +135,23 @@ void board_adc_sync_rst_release(void);
 uint16_t board_voltage_to_dac_code(float voltage_v);
 
 /**
+ * Convert desired board output voltage to the raw DAC pin voltage.
+ *
+ * This is useful for debug/status output because the DAC pin itself sits at
+ * a positive voltage (for example ~2.5 V when the modeled board output is
+ * 0 V through the subtractor stage).
+ */
+float board_output_voltage_to_dac_pin_voltage(float voltage_v);
+
+/**
  * Convert DAC code to output voltage.
  */
 float board_dac_code_to_voltage(uint16_t code);
+
+/**
+ * Convert DAC code to the raw DAC pin voltage.
+ */
+float board_dac_code_to_dac_pin_voltage(uint16_t code);
 
 /**
  * Called from HAL_UART_TxCpltCallback (ISR context) when USART1 DMA TX

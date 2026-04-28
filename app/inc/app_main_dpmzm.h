@@ -36,6 +36,14 @@ void app_dpmzm_init(void);
 void app_dpmzm_run(void);
 
 /**
+ * Push the current logical I/Q/P bias state to the DAC hardware.
+ *
+ * This is used after DAC reset/re-init so the analog outputs are explicitly
+ * resynchronized with the cached DPMZM context.
+ */
+int app_dpmzm_sync_bias_outputs(void);
+
+/**
  * Handle a DPMZM-specific UART command.
  */
 void app_dpmzm_handle_command(const char *cmd);

@@ -70,11 +70,25 @@ typedef struct {
     float secondary_best_sweep_value;
 } dpmzm_scan_summary_t;
 
+typedef struct {
+    float sweep_v;
+    float mag_fi;
+    float mag_fq;
+    float mag_fdiff;
+    float mag_fsum;
+    float dc_mean;
+} dpmzm_scan_point_t;
+
 const char *dpmzm_scan_stage_name(dpmzm_scan_stage_t stage);
 const char *dpmzm_scan_target_name(dpmzm_scan_target_t target);
 const char *dpmzm_scan_pilot_mode_name(dpmzm_scan_pilot_mode_t mode);
 
 bool dpmzm_scan_run(const dpmzm_scan_request_t *req,
                     dpmzm_scan_summary_t *summary_out);
+bool dpmzm_scan_run_collect(const dpmzm_scan_request_t *req,
+                            dpmzm_scan_summary_t *summary_out,
+                            dpmzm_scan_point_t *points,
+                            uint32_t point_capacity,
+                            uint32_t *point_count_out);
 
 #endif /* CTRL_SCAN_DPMZM_H */

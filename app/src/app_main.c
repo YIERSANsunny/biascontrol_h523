@@ -1193,6 +1193,11 @@ static void state_selftest(void)
     int ret = dac8568_init();
     if (ret != 0) {
         printf("[app] WARNING: DAC8568 init failed (%d), continuing without DAC\r\n", ret);
+    } else {
+        int dpmzm_ret = app_dpmzm_sync_bias_outputs();
+        if (dpmzm_ret != 0) {
+            printf("[dpmzm] WARNING: initial bias sync failed (%d)\r\n", dpmzm_ret);
+        }
     }
 
     /* Initialize ADS131M02 — fatal if ADC fails */

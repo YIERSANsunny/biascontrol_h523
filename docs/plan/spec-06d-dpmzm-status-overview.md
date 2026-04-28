@@ -26,6 +26,9 @@
 3. `spec-06b-dpmzm-parallel-files.md`
 4. `spec-06c-dpmzm-first-batch-files.md`
 5. `spec-06e-dpmzm-uart-checklist.md`
+6. `spec-06f-dpmzm-closed-loop-strategy.md`
+7. `spec-06g-dpmzm-v1-implementation-checklist.md`
+8. `spec-06h-dpmzm-v1-code-change-checklist.md`
 
 ---
 

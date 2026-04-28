@@ -20,6 +20,17 @@ typedef struct {
     uint32_t sample_count;
 } dpmzm_measurement_t;
 
+typedef enum {
+    DPMZM_MEASURE_FI    = (1U << 0),
+    DPMZM_MEASURE_FQ    = (1U << 1),
+    DPMZM_MEASURE_FDIFF = (1U << 2),
+    DPMZM_MEASURE_FSUM  = (1U << 3),
+    DPMZM_MEASURE_ALL   = DPMZM_MEASURE_FI |
+                          DPMZM_MEASURE_FQ |
+                          DPMZM_MEASURE_FDIFF |
+                          DPMZM_MEASURE_FSUM
+} dpmzm_measure_flags_t;
+
 /**
  * DPMZM multi-frequency Goertzel measurement context.
  */
@@ -33,6 +44,7 @@ typedef struct {
     float pilot_q_freq_hz;
     float sample_rate_hz;
     uint32_t block_size;
+    uint32_t enabled_flags;
 } dpmzm_measure_ctx_t;
 
 /**
@@ -43,6 +55,18 @@ void dpmzm_measure_init(dpmzm_measure_ctx_t *ctx,
                         float pilot_q_freq_hz,
                         float sample_rate_hz,
                         uint32_t block_size);
+
+/**
+ * Initialize a DPMZM measurement context and select the AC frequencies to run.
+ *
+ * DC is always accumulated. Disabled AC outputs are returned as 0.0f.
+ */
+void dpmzm_measure_init_select(dpmzm_measure_ctx_t *ctx,
+                               float pilot_i_freq_hz,
+                               float pilot_q_freq_hz,
+                               float sample_rate_hz,
+                               uint32_t block_size,
+                               uint32_t enabled_flags);
 
 /**
  * Reset the internal accumulators for a new coherent block.

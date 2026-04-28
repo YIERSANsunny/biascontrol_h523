@@ -14,6 +14,9 @@
 #define DPMZM_SCAN_DRDY_TIMEOUT_MS 5U
 #define DPMZM_SCAN_DISCARD_BLOCKS_AFTER_SETTLE 1U
 
+static float s_scan_block_ac[DSP_GOERTZEL_BLOCK_SIZE];
+static float s_scan_block_dc[DSP_GOERTZEL_BLOCK_SIZE];
+
 typedef struct {
     float phase_rad;
     float phase_step_rad;
@@ -141,21 +144,21 @@ static float primary_metric_value(const dpmzm_scan_request_t *req,
     }
 }
 
-static float secondary_metric_value(const dpmzm_scan_request_t *req,
-                                    const dpmzm_measurement_t *m)
+static uint32_t scan_measure_flags(const dpmzm_scan_request_t *req)
 {
-    if (req == NULL || m == NULL) {
-        return FLT_MAX;
+    if (req == NULL) {
+        return DPMZM_MEASURE_ALL;
     }
 
     switch (req->stage) {
     case DPMZM_SCAN_STAGE_QTP:
-        return m->mag_fdiff;
+        return DPMZM_MEASURE_FSUM;
     case DPMZM_SCAN_STAGE_MATP:
     case DPMZM_SCAN_STAGE_MITP:
-        return (req->target == DPMZM_SCAN_TARGET_Q) ? m->mag_fi : m->mag_fq;
+        return (req->target == DPMZM_SCAN_TARGET_Q) ?
+               DPMZM_MEASURE_FQ : DPMZM_MEASURE_FI;
     default:
-        return FLT_MAX;
+        return DPMZM_MEASURE_ALL;
     }
 }
 
@@ -362,11 +365,12 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
         return false;
     }
 
-    dpmzm_measure_init(&measure_ctx,
-                       req->pilot_i_freq_hz,
-                       req->pilot_q_freq_hz,
-                       (float)DSP_SAMPLE_RATE_HZ,
-                       DSP_GOERTZEL_BLOCK_SIZE);
+    dpmzm_measure_init_select(&measure_ctx,
+                              req->pilot_i_freq_hz,
+                              req->pilot_q_freq_hz,
+                              (float)DSP_SAMPLE_RATE_HZ,
+                              DSP_GOERTZEL_BLOCK_SIZE,
+                              scan_measure_flags(req));
     if (req->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD &&
         !req->continuous_onboard_pilot) {
         tone_gen_init(&tone_i,
@@ -418,6 +422,11 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
                 return false;
             }
 
+            s_scan_block_ac[s] = sample_ac_v;
+            s_scan_block_dc[s] = sample_dc_v;
+        }
+
+        for (s = 0; s < DSP_GOERTZEL_BLOCK_SIZE; s++) {
             if (req->dump_mode == DPMZM_SCAN_DUMP_RAW ||
                 req->dump_mode == DPMZM_SCAN_DUMP_BOTH) {
                 print_raw_line(req,
@@ -427,10 +436,12 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
                                base_vp,
                                b,
                                s,
-                               sample_ac_v);
+                               s_scan_block_ac[s]);
             }
 
-            dpmzm_measure_process_sample(&measure_ctx, sample_ac_v, sample_dc_v);
+            dpmzm_measure_process_sample(&measure_ctx,
+                                         s_scan_block_ac[s],
+                                         s_scan_block_dc[s]);
         }
 
         if (!dpmzm_measure_finalize(&measure_ctx, &block_result)) {
@@ -458,15 +469,28 @@ static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
 bool dpmzm_scan_run(const dpmzm_scan_request_t *req,
                     dpmzm_scan_summary_t *summary_out)
 {
+    return dpmzm_scan_run_collect(req, summary_out, NULL, 0U, NULL);
+}
+
+bool dpmzm_scan_run_collect(const dpmzm_scan_request_t *req,
+                            dpmzm_scan_summary_t *summary_out,
+                            dpmzm_scan_point_t *points,
+                            uint32_t point_capacity,
+                            uint32_t *point_count_out)
+{
     dpmzm_scan_summary_t local_summary;
     float sweep = 0.0f;
     bool first_point = true;
     float best_metric = FLT_MAX;
     float second_metric = FLT_MAX;
     float step_sign;
+    uint32_t point_count = 0U;
 
     if (!scan_request_valid(req)) {
         return false;
+    }
+    if (point_count_out != NULL) {
+        *point_count_out = 0U;
     }
 
     local_summary.valid = false;
@@ -495,6 +519,18 @@ bool dpmzm_scan_run(const dpmzm_scan_request_t *req,
             req->dump_mode == DPMZM_SCAN_DUMP_BOTH) {
             print_csv_line(req, sweep, base_vi, base_vq, base_vp, &m);
         }
+        if (points != NULL) {
+            if (point_count >= point_capacity) {
+                return false;
+            }
+            points[point_count].sweep_v = sweep;
+            points[point_count].mag_fi = m.mag_fi;
+            points[point_count].mag_fq = m.mag_fq;
+            points[point_count].mag_fdiff = m.mag_fdiff;
+            points[point_count].mag_fsum = m.mag_fsum;
+            points[point_count].dc_mean = m.dc_mean;
+        }
+        point_count++;
 
         primary = primary_metric_value(req, &m);
         if (first_point || primary < best_metric) {
@@ -521,6 +557,9 @@ bool dpmzm_scan_run(const dpmzm_scan_request_t *req,
 
     if (summary_out != NULL) {
         *summary_out = local_summary;
+    }
+    if (point_count_out != NULL) {
+        *point_count_out = point_count;
     }
 
     return local_summary.valid;

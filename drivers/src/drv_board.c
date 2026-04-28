@@ -168,12 +168,11 @@ void board_adc_sync_rst_release(void)
 /*  Voltage / DAC code conversion                                            */
 /* ========================================================================= */
 
-uint16_t board_voltage_to_dac_code(float voltage_v)
+float board_output_voltage_to_dac_pin_voltage(float voltage_v)
 {
     /*
      * Output voltage: V_out = GAIN * V_dac + OFFSET
      * Solve for V_dac: V_dac = (V_out - OFFSET) / GAIN
-     * DAC code: code = V_dac / (2 * VREF) * 65536
      */
     float v_dac = (voltage_v - SUBTRACTOR_OFFSET_V) / SUBTRACTOR_GAIN;
 
@@ -186,6 +185,14 @@ uint16_t board_voltage_to_dac_code(float voltage_v)
         v_dac = v_max;
     }
 
+    return v_dac;
+}
+
+uint16_t board_voltage_to_dac_code(float voltage_v)
+{
+    /* DAC code: code = V_dac / (2 * VREF) * 65536 */
+    float v_max = DAC_VREF_V * 2.0f;
+    float v_dac = board_output_voltage_to_dac_pin_voltage(voltage_v);
     uint32_t code = (uint32_t)(v_dac / v_max * 65535.0f + 0.5f);
     if (code > 65535) {
         code = 65535;
@@ -193,8 +200,13 @@ uint16_t board_voltage_to_dac_code(float voltage_v)
     return (uint16_t)code;
 }
 
+float board_dac_code_to_dac_pin_voltage(uint16_t code)
+{
+    return (float)code / 65535.0f * DAC_VREF_V * 2.0f;
+}
+
 float board_dac_code_to_voltage(uint16_t code)
 {
-    float v_dac = (float)code / 65535.0f * DAC_VREF_V * 2.0f;
+    float v_dac = board_dac_code_to_dac_pin_voltage(code);
     return SUBTRACTOR_GAIN * v_dac + SUBTRACTOR_OFFSET_V;
 }

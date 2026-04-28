@@ -1,4 +1,5 @@
 #include "app_main_dpmzm.h"
+#include "ctrl_auto_dpmzm.h"
 #include "dsp_types.h"
 #include "ctrl_scan_dpmzm.h"
 #include "drv_ads131m02.h"
@@ -546,6 +547,9 @@ static void print_status(void)
             ? (s_pilot_timer_running ? "continuous" : "continuous-failed")
             : "scan-only";
     float pilot_timer_rate_hz = compute_tim6_update_rate_hz();
+    uint16_t code_i = board_voltage_to_dac_code(s_dpmzm_ctx.bias_i_v);
+    uint16_t code_q = board_voltage_to_dac_code(s_dpmzm_ctx.bias_q_v);
+    uint16_t code_p = board_voltage_to_dac_code(s_dpmzm_ctx.bias_p_v);
 
     s_pilot_timer_rate_hz = pilot_timer_rate_hz;
 
@@ -555,10 +559,19 @@ static void print_status(void)
            (unsigned)s_dpmzm_ctx.config->bias_i_dac_channel,
            (unsigned)s_dpmzm_ctx.config->bias_q_dac_channel,
            (unsigned)s_dpmzm_ctx.config->bias_p_dac_channel);
-    printf("  bias voltage:  I=%+.3fV Q=%+.3fV P=%+.3fV\r\n",
-           (double)s_dpmzm_ctx.bias_i_v,
-           (double)s_dpmzm_ctx.bias_q_v,
-           (double)s_dpmzm_ctx.bias_p_v);
+    printf("  bias target:   I=%+.3fV Q=%+.3fV P=%+.3fV\r\n",
+             (double)s_dpmzm_ctx.bias_i_v,
+             (double)s_dpmzm_ctx.bias_q_v,
+             (double)s_dpmzm_ctx.bias_p_v);
+    printf("  dac code:      I=%u Q=%u P=%u\r\n",
+           (unsigned)code_i,
+           (unsigned)code_q,
+           (unsigned)code_p);
+    printf("  dac pin model: I=%.3fV Q=%.3fV P=%.3fV\r\n",
+           (double)board_dac_code_to_dac_pin_voltage(code_i),
+           (double)board_dac_code_to_dac_pin_voltage(code_q),
+           (double)board_dac_code_to_dac_pin_voltage(code_p));
+    printf("  note:          status is target/model only, no analog readback\r\n");
     printf("  pilot source:  %s\r\n",
            pilot_source_name(s_dpmzm_ctx.config->pilot_source));
     printf("  pilot output:  %s\r\n",
@@ -890,6 +903,72 @@ static void handle_scan_placeholder(const char *cmd)
            (double)summary.best_metric_value);
 }
 
+static void handle_auto_status(void)
+{
+    dpmzm_auto_print_status();
+}
+
+static void handle_auto_coarse(void)
+{
+    dpmzm_auto_coarse_request_t req;
+    dpmzm_auto_coarse_result_t result;
+    bool ok;
+    int apply_ret = 0;
+
+    memset(&req, 0, sizeof(req));
+    memset(&result, 0, sizeof(result));
+
+    req.sweep_min_v = -9.0f;
+    req.sweep_max_v = 9.0f;
+    req.sweep_step_v = 0.1f;
+    req.scan_template.blocks = s_dpmzm_ctx.config->scan_default_blocks;
+    req.scan_template.settle_ms = 2U;
+    req.scan_template.bias_i_v = s_dpmzm_ctx.bias_i_v;
+    req.scan_template.bias_q_v = s_dpmzm_ctx.bias_q_v;
+    req.scan_template.bias_p_v = s_dpmzm_ctx.bias_p_v;
+    req.scan_template.bias_i_dac_channel = s_dpmzm_ctx.config->bias_i_dac_channel;
+    req.scan_template.bias_q_dac_channel = s_dpmzm_ctx.config->bias_q_dac_channel;
+    req.scan_template.bias_p_dac_channel = s_dpmzm_ctx.config->bias_p_dac_channel;
+    req.scan_template.pilot_i_freq_hz = s_dpmzm_ctx.config->pilot_i_freq_hz;
+    req.scan_template.pilot_q_freq_hz = s_dpmzm_ctx.config->pilot_q_freq_hz;
+    req.scan_template.pilot_i_amp_v = s_dpmzm_ctx.config->pilot_i_amp_v;
+    req.scan_template.pilot_q_amp_v = s_dpmzm_ctx.config->pilot_q_amp_v;
+    req.scan_template.pilot_mode = to_scan_pilot_mode(s_dpmzm_ctx.config->pilot_source);
+    req.scan_template.dump_mode = to_scan_dump_mode(s_dpmzm_ctx.config->dump_mode);
+    req.scan_template.continuous_onboard_pilot =
+        (req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD);
+    req.scan_template.bias_apply_fn = app_dpmzm_scan_apply_bias_triplet;
+
+    printf("[dpmzm][auto] coarse start: range=%+.1f..%+.1fV step=%.3f blocks=%lu\r\n",
+           (double)req.sweep_min_v,
+           (double)req.sweep_max_v,
+           (double)req.sweep_step_v,
+           (unsigned long)req.scan_template.blocks);
+
+    if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
+        printf("[dpmzm][auto] failed: onboard pilot start failed\r\n");
+        return;
+    }
+
+    ok = dpmzm_auto_run_coarse(&req, &result);
+    app_dpmzm_scan_end();
+
+    dpmzm_auto_print_result(&result);
+    if (!ok) {
+        printf("[dpmzm][auto] coarse failed\r\n");
+        return;
+    }
+
+    apply_ret = app_dpmzm_scan_apply_bias_triplet(result.i_mitp_coarse_v,
+                                                  result.q_mitp_coarse_v,
+                                                  result.p_qtp_coarse_v);
+    printf("[dpmzm][auto] applied coarse result: I=%+.3fV Q=%+.3fV P=%+.3fV (ret=%d)\r\n",
+           (double)result.i_mitp_coarse_v,
+           (double)result.q_mitp_coarse_v,
+           (double)result.p_qtp_coarse_v,
+           apply_ret);
+}
+
 static bool wait_and_read_capture_sample(ads131m02_sample_t *sample_out)
 {
     uint32_t t0;
@@ -1103,6 +1182,7 @@ static void handle_capture_raw(const char *cmd)
 void app_dpmzm_init(void)
 {
     app_config_dpmzm_defaults();
+    dpmzm_auto_init();
     s_dpmzm_ctx.config = app_config_dpmzm_get();
     s_dpmzm_ctx.bias_i_v = s_dpmzm_ctx.config->bias_i_initial_v;
     s_dpmzm_ctx.bias_q_v = s_dpmzm_ctx.config->bias_q_initial_v;
@@ -1127,6 +1207,19 @@ void app_dpmzm_init(void)
 void app_dpmzm_run(void)
 {
     /* Continuous pilot output is driven by TIM6 interrupt. */
+}
+
+int app_dpmzm_sync_bias_outputs(void)
+{
+    if (!s_dpmzm_ctx.initialized) {
+        return -1;
+    }
+
+    if (timer_owns_dac_outputs()) {
+        return apply_current_drive();
+    }
+
+    return apply_biases();
 }
 
 const app_dpmzm_context_t *app_dpmzm_get_context(void)
@@ -1158,6 +1251,10 @@ void app_dpmzm_handle_command(const char *cmd)
         handle_set_dump(cmd);
     } else if (strncmp(cmd, "capture raw ", 12) == 0) {
         handle_capture_raw(cmd);
+    } else if (strcmp(cmd, "auto coarse") == 0) {
+        handle_auto_coarse();
+    } else if (strcmp(cmd, "auto status") == 0) {
+        handle_auto_status();
     } else if (strncmp(cmd, "scan matp ", 10) == 0 ||
                strncmp(cmd, "scan qtp ", 9) == 0 ||
                strncmp(cmd, "scan mitp ", 10) == 0) {
