@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include "dsp_goertzel.h"
 
+#define DPMZM_MEASURE_SEARCH_TONE_COUNT 7U
+
 /**
  * DPMZM multi-frequency measurement result for one coherent block.
  *
@@ -35,10 +37,10 @@ typedef enum {
  * DPMZM multi-frequency Goertzel measurement context.
  */
 typedef struct {
-    goertzel_state_t g_fi;
-    goertzel_state_t g_fq;
-    goertzel_state_t g_fdiff;
-    goertzel_state_t g_fsum;
+    goertzel_state_t g_fi[DPMZM_MEASURE_SEARCH_TONE_COUNT];
+    goertzel_state_t g_fq[DPMZM_MEASURE_SEARCH_TONE_COUNT];
+    goertzel_state_t g_fdiff[DPMZM_MEASURE_SEARCH_TONE_COUNT];
+    goertzel_state_t g_fsum[DPMZM_MEASURE_SEARCH_TONE_COUNT];
     dc_accum_t dc_acc;
     float pilot_i_freq_hz;
     float pilot_q_freq_hz;

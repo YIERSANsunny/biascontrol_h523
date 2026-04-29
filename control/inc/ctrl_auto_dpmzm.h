@@ -20,8 +20,6 @@ typedef enum {
     DPMZM_AUTO_FINE_SCAN_I_FINE,
     DPMZM_AUTO_FINE_SCAN_Q_WIDE,
     DPMZM_AUTO_FINE_SCAN_Q_FINE,
-    DPMZM_AUTO_FINE_SCAN_P_FINAL_GLOBAL,
-    DPMZM_AUTO_FINE_SCAN_P_FINAL_FINE,
     DPMZM_AUTO_DONE,
     DPMZM_AUTO_FAILED
 } dpmzm_auto_state_t;
@@ -100,7 +98,6 @@ typedef struct {
     float wide_step_v;
     float p_fine_range_v;
     float iq_fine_range_v;
-    float expanded_range_v;
     float fine_step_v;
 } dpmzm_auto_fine_request_t;
 

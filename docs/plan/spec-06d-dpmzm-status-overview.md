@@ -590,6 +590,8 @@ DPMZM 通过平行新增文件的方式推进，而不是大面积侵入旧 MZM 
 2. `dpmzm auto fine`：基于粗扫结果执行宽窗 + 小窗细扫，得到更可信的 `I/Q/P` 局部候选点。
 3. `dpmzm lock probe/step/start/stop/status`：基于小扰动有符号误差做低速闭环守点。
 
+当前 `auto coarse` 的默认粗扫步进已经调整为 `0.5 V`，目的是显著缩短粗扫耗时；精确定位继续由后续 `auto fine` 的 `0.1 V / 0.01 V` 两级细扫完成。
+
 当前固件新增了独立闭环模块：
 
 - `control/inc/ctrl_lock_dpmzm.h`
@@ -621,7 +623,7 @@ dpmzm lock start
 - `tools/run_dpmzm_positive_branch_flow.py`
 - 外部实验副本：`C:\Users\Administrator\Desktop\DPMZM_contral_bais\Python_code\run_dpmzm_positive_branch_flow.py`
 
-这一步的关键经验是：自动流程必须显式规定粗扫起点。若直接继承上一次实验的最终偏压，粗扫可能被带到另一条分支，导致 `auto fine` 在扩窗阶段返回 `NEED_WIDER_WINDOW`。因此脚本默认会先将 `I/Q/P` 归零，再开始粗扫；如需从当前板上状态继续实验，可显式加 `--skip-initial-bias`。
+这一步的关键经验是：自动流程必须显式规定粗扫起点。若直接继承上一次实验的最终偏压，粗扫可能被带到另一条分支。当前 `auto fine` 已移除末尾的 `P-QTP final global`，并把贴边策略改为“以贴边 best 为中心继续同样 `+/- 0.6 V` 小窗重扫”，不再自动阔窗或直接返回 `NEED_WIDER_WINDOW`。因此脚本默认会先将 `I/Q/P` 归零，再开始粗扫；如需从当前板上状态继续实验，可显式加 `--skip-initial-bias`。
 
 当前阶段判断更新为：
 
@@ -630,4 +632,4 @@ dpmzm lock start
 - 自动细扫：已完成并上板验证。
 - 低速闭环：固件接口已完成，已能由脚本在扫描结束后自动启动。
 - 长时间稳定性：仍需后续连续观测。
-- 分支选择：正 P 分支复现流程已脚本化，固件内部最终 P 全局重扫仍可能选择负分支，需要后续继续优化选择规则。
+- 分支选择：正 P 分支复现流程已脚本化；固件内部已移除最终 P 全局重扫，后续重点转为验证当前分支保留策略的重复性。

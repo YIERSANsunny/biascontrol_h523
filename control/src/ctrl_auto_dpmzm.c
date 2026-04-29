@@ -14,7 +14,6 @@
 #define DPMZM_AUTO_MIN_SEPARATION_ABS_V       0.8f
 #define DPMZM_AUTO_EDGE_MARGIN_POINTS         5U
 #define DPMZM_AUTO_DBM_FLOOR_MW               1e-15f
-#define DPMZM_AUTO_FINAL_P_GLOBAL_STEP_V      0.1f
 
 static dpmzm_auto_context_t s_auto_ctx;
 static dpmzm_scan_point_t s_scan_points[DPMZM_AUTO_SCAN_POINTS_MAX];
@@ -50,10 +49,6 @@ static const char *auto_state_name(dpmzm_auto_state_t state)
         return "FINE_SCAN_Q_WIDE";
     case DPMZM_AUTO_FINE_SCAN_Q_FINE:
         return "FINE_SCAN_Q_FINE";
-    case DPMZM_AUTO_FINE_SCAN_P_FINAL_GLOBAL:
-        return "FINE_SCAN_P_FINAL_GLOBAL";
-    case DPMZM_AUTO_FINE_SCAN_P_FINAL_FINE:
-        return "FINE_SCAN_P_FINAL_FINE";
     case DPMZM_AUTO_DONE:
         return "DONE";
     case DPMZM_AUTO_FAILED:
@@ -227,8 +222,7 @@ static bool fine_request_valid(const dpmzm_auto_fine_request_t *req)
     }
     if (req->wide_range_v <= 0.0f ||
         req->p_fine_range_v <= 0.0f ||
-        req->iq_fine_range_v <= 0.0f ||
-        req->expanded_range_v <= 0.0f) {
+        req->iq_fine_range_v <= 0.0f) {
         return false;
     }
     if (req->scan_template.blocks == 0U) {
@@ -245,11 +239,6 @@ static bool fine_request_valid(const dpmzm_auto_fine_request_t *req)
                              req->wide_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
         return false;
     }
-    if (expected_point_count(-req->expanded_range_v,
-                             req->expanded_range_v,
-                             req->fine_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
-        return false;
-    }
     if (expected_point_count(-req->p_fine_range_v,
                              req->p_fine_range_v,
                              req->fine_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
@@ -258,11 +247,6 @@ static bool fine_request_valid(const dpmzm_auto_fine_request_t *req)
     if (expected_point_count(-req->iq_fine_range_v,
                              req->iq_fine_range_v,
                              req->fine_step_v) > DPMZM_AUTO_SCAN_POINTS_MAX) {
-        return false;
-    }
-    if (expected_point_count(req->sweep_min_v,
-                             req->sweep_max_v,
-                             DPMZM_AUTO_FINAL_P_GLOBAL_STEP_V) > DPMZM_AUTO_SCAN_POINTS_MAX) {
         return false;
     }
     return true;
@@ -1098,54 +1082,6 @@ static bool run_best_window_scan(dpmzm_scan_request_t *scan_req,
     return true;
 }
 
-static bool run_best_absolute_scan(dpmzm_scan_request_t *scan_req,
-                                   dpmzm_scan_stage_t stage,
-                                   dpmzm_scan_target_t target,
-                                   float start_v,
-                                   float stop_v,
-                                   float step_v,
-                                   float *best_v)
-{
-    dpmzm_scan_summary_t summary;
-    uint32_t point_count = 0U;
-    float best_metric_dbm = 0.0f;
-
-    if (scan_req == NULL || best_v == NULL) {
-        return false;
-    }
-
-    if (!run_collect_scan(scan_req,
-                          stage,
-                          target,
-                          start_v,
-                          stop_v,
-                          step_v,
-                          &summary,
-                          &point_count)) {
-        return false;
-    }
-
-    if (!pick_best_point(stage,
-                         target,
-                         s_scan_points,
-                         point_count,
-                         best_v,
-                         &best_metric_dbm,
-                         NULL)) {
-        return false;
-    }
-
-    printf("[dpmzm][auto] fine global pick: stage=%s target=%s range=%+.3f..%+.3fV step=%.3f best=%+.3fV %.2fdBm\r\n",
-           dpmzm_scan_stage_name(stage),
-           dpmzm_scan_target_name(target),
-           (double)start_v,
-           (double)stop_v,
-           (double)step_v,
-           (double)*best_v,
-           (double)best_metric_dbm);
-    return true;
-}
-
 static void print_matp_candidates(const char *label,
                                   const dpmzm_matp_candidate_t *candidates,
                                   uint32_t count)
@@ -1501,17 +1437,13 @@ bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
                                   DPMZM_SCAN_STAGE_QTP,
                                   DPMZM_SCAN_TARGET_P,
                                   p_final,
-                                  req->expanded_range_v,
+                                  req->p_fine_range_v,
                                   req->fine_step_v,
                                   req->sweep_min_v,
                                   req->sweep_max_v,
                                   &result.p_qtp_fine_v,
                                   &edge)) {
             result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-            goto fail;
-        }
-        if (edge) {
-            result.error = DPMZM_AUTO_ERR_NEED_WIDER_WINDOW;
             goto fail;
         }
     }
@@ -1567,17 +1499,13 @@ bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
                                   DPMZM_SCAN_STAGE_MITP,
                                   DPMZM_SCAN_TARGET_I,
                                   i_final,
-                                  req->expanded_range_v,
+                                  req->iq_fine_range_v,
                                   req->fine_step_v,
                                   req->sweep_min_v,
                                   req->sweep_max_v,
                                   &result.i_mitp_fine_v,
                                   &edge)) {
             result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-            goto fail;
-        }
-        if (edge) {
-            result.error = DPMZM_AUTO_ERR_NEED_WIDER_WINDOW;
             goto fail;
         }
     }
@@ -1633,7 +1561,7 @@ bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
                                   DPMZM_SCAN_STAGE_MITP,
                                   DPMZM_SCAN_TARGET_Q,
                                   q_final,
-                                  req->expanded_range_v,
+                                  req->iq_fine_range_v,
                                   req->fine_step_v,
                                   req->sweep_min_v,
                                   req->sweep_max_v,
@@ -1642,82 +1570,15 @@ bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
             result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
             goto fail;
         }
-        if (edge) {
-            result.error = DPMZM_AUTO_ERR_NEED_WIDER_WINDOW;
-            goto fail;
-        }
     }
     q_final = result.q_mitp_fine_v;
     result.q_mitp_valid = true;
 
     /*
-     * P-QTP depends strongly on the final I/Q bias point. The first P fine pass
-     * is only a staging point that makes I/Q MITP scans usable; after I/Q move,
-     * re-run a full-range P pass and then a small-window fine pass.
+     * Keep the selected P-QTP branch after I/Q refinement. A final full-range P
+     * pass is deliberately omitted because it can jump to another QTP branch
+     * and slows down the automatic fine workflow.
      */
-    set_state(DPMZM_AUTO_FINE_SCAN_P_FINAL_GLOBAL);
-    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
-        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-        goto fail;
-    }
-    if (!run_best_absolute_scan(&scan_req,
-                                DPMZM_SCAN_STAGE_QTP,
-                                DPMZM_SCAN_TARGET_P,
-                                req->sweep_min_v,
-                                req->sweep_max_v,
-                                DPMZM_AUTO_FINAL_P_GLOBAL_STEP_V,
-                                &result.p_qtp_wide_v)) {
-        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-        goto fail;
-    }
-
-    set_state(DPMZM_AUTO_FINE_SCAN_P_FINAL_FINE);
-    p_final = result.p_qtp_wide_v;
-    result.p_qtp_expanded = false;
-    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
-        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-        goto fail;
-    }
-    if (!run_best_window_scan(&scan_req,
-                              DPMZM_SCAN_STAGE_QTP,
-                              DPMZM_SCAN_TARGET_P,
-                              p_final,
-                              req->p_fine_range_v,
-                              req->fine_step_v,
-                              req->sweep_min_v,
-                              req->sweep_max_v,
-                              &result.p_qtp_fine_v,
-                              &edge)) {
-        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-        goto fail;
-    }
-    if (edge) {
-        result.p_qtp_expanded = true;
-        p_final = result.p_qtp_fine_v;
-        if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
-            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-            goto fail;
-        }
-        if (!run_best_window_scan(&scan_req,
-                                  DPMZM_SCAN_STAGE_QTP,
-                                  DPMZM_SCAN_TARGET_P,
-                                  p_final,
-                                  req->expanded_range_v,
-                                  req->fine_step_v,
-                                  req->sweep_min_v,
-                                  req->sweep_max_v,
-                                  &result.p_qtp_fine_v,
-                                  &edge)) {
-            result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
-            goto fail;
-        }
-        if (edge) {
-            result.error = DPMZM_AUTO_ERR_NEED_WIDER_WINDOW;
-            goto fail;
-        }
-    }
-    p_final = result.p_qtp_fine_v;
-    result.p_qtp_valid = true;
 
     set_state(DPMZM_AUTO_DONE);
     result.error = DPMZM_AUTO_OK;
@@ -1769,18 +1630,18 @@ void dpmzm_auto_print_fine_result(const dpmzm_auto_fine_result_t *result)
 
     printf("[dpmzm][auto] fine result\r\n");
     printf("  error:        %s\r\n", auto_error_name(result->error));
-    printf("  P QTP final coarse: %+.3fV\r\n", (double)result->p_qtp_wide_v);
-    printf("  P QTP final fine:   %+.3fV (%s, expanded=%s)\r\n",
+    printf("  P QTP wide:  %+.3fV\r\n", (double)result->p_qtp_wide_v);
+    printf("  P QTP fine:  %+.3fV (%s, edge-rescan=%s)\r\n",
            (double)result->p_qtp_fine_v,
            result->p_qtp_valid ? "valid" : "invalid",
            result->p_qtp_expanded ? "yes" : "no");
     printf("  I MITP wide:  %+.3fV\r\n", (double)result->i_mitp_wide_v);
-    printf("  I MITP fine:  %+.3fV (%s, expanded=%s)\r\n",
+    printf("  I MITP fine:  %+.3fV (%s, edge-rescan=%s)\r\n",
            (double)result->i_mitp_fine_v,
            result->i_mitp_valid ? "valid" : "invalid",
            result->i_mitp_expanded ? "yes" : "no");
     printf("  Q MITP wide:  %+.3fV\r\n", (double)result->q_mitp_wide_v);
-    printf("  Q MITP fine:  %+.3fV (%s, expanded=%s)\r\n",
+    printf("  Q MITP fine:  %+.3fV (%s, edge-rescan=%s)\r\n",
            (double)result->q_mitp_fine_v,
            result->q_mitp_valid ? "valid" : "invalid",
            result->q_mitp_expanded ? "yes" : "no");

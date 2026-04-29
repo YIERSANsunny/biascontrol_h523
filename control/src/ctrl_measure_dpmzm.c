@@ -17,6 +17,79 @@ static bool dpmzm_measure_enabled(const dpmzm_measure_ctx_t *ctx,
     return ctx != NULL && ((ctx->enabled_flags & flag) != 0U);
 }
 
+static const float s_measure_search_offsets_hz[DPMZM_MEASURE_SEARCH_TONE_COUNT] = {
+    -150.0f, -100.0f, -50.0f, 0.0f, 50.0f, 100.0f, 150.0f
+};
+
+static float clamp_search_freq_hz(float freq_hz)
+{
+    return (freq_hz > 1.0f) ? freq_hz : 1.0f;
+}
+
+static void init_goertzel_bank(goertzel_state_t bank[DPMZM_MEASURE_SEARCH_TONE_COUNT],
+                               float center_freq_hz,
+                               float sample_rate_hz,
+                               uint32_t block_size)
+{
+    uint32_t i;
+
+    for (i = 0U; i < DPMZM_MEASURE_SEARCH_TONE_COUNT; i++) {
+        goertzel_init(&bank[i],
+                      clamp_search_freq_hz(center_freq_hz + s_measure_search_offsets_hz[i]),
+                      sample_rate_hz,
+                      block_size);
+    }
+}
+
+static void reset_goertzel_bank(goertzel_state_t bank[DPMZM_MEASURE_SEARCH_TONE_COUNT])
+{
+    uint32_t i;
+
+    for (i = 0U; i < DPMZM_MEASURE_SEARCH_TONE_COUNT; i++) {
+        goertzel_reset(&bank[i]);
+    }
+}
+
+static void process_goertzel_bank(goertzel_state_t bank[DPMZM_MEASURE_SEARCH_TONE_COUNT],
+                                  float sample)
+{
+    uint32_t i;
+
+    for (i = 0U; i < DPMZM_MEASURE_SEARCH_TONE_COUNT; i++) {
+        goertzel_process_sample(&bank[i], sample);
+    }
+}
+
+static bool goertzel_bank_ready(const goertzel_state_t bank[DPMZM_MEASURE_SEARCH_TONE_COUNT])
+{
+    uint32_t i;
+
+    for (i = 0U; i < DPMZM_MEASURE_SEARCH_TONE_COUNT; i++) {
+        if (!goertzel_block_ready(&bank[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static float goertzel_bank_max_magnitude(goertzel_state_t bank[DPMZM_MEASURE_SEARCH_TONE_COUNT])
+{
+    float best_mag = 0.0f;
+    float phase = 0.0f;
+    uint32_t i;
+
+    for (i = 0U; i < DPMZM_MEASURE_SEARCH_TONE_COUNT; i++) {
+        float mag = 0.0f;
+
+        goertzel_get_result(&bank[i], &mag, &phase);
+        if (mag > best_mag) {
+            best_mag = mag;
+        }
+    }
+
+    return best_mag;
+}
+
 void dpmzm_measure_init(dpmzm_measure_ctx_t *ctx,
                         float pilot_i_freq_hz,
                         float pilot_q_freq_hz,
@@ -49,16 +122,16 @@ void dpmzm_measure_init_select(dpmzm_measure_ctx_t *ctx,
     ctx->enabled_flags = enabled_flags;
 
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FI)) {
-        goertzel_init(&ctx->g_fi, pilot_i_freq_hz, sample_rate_hz, block_size);
+        init_goertzel_bank(ctx->g_fi, pilot_i_freq_hz, sample_rate_hz, block_size);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FQ)) {
-        goertzel_init(&ctx->g_fq, pilot_q_freq_hz, sample_rate_hz, block_size);
+        init_goertzel_bank(ctx->g_fq, pilot_q_freq_hz, sample_rate_hz, block_size);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FDIFF)) {
-        goertzel_init(&ctx->g_fdiff, dpmzm_freq_diff_hz(ctx), sample_rate_hz, block_size);
+        init_goertzel_bank(ctx->g_fdiff, dpmzm_freq_diff_hz(ctx), sample_rate_hz, block_size);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FSUM)) {
-        goertzel_init(&ctx->g_fsum, dpmzm_freq_sum_hz(ctx), sample_rate_hz, block_size);
+        init_goertzel_bank(ctx->g_fsum, dpmzm_freq_sum_hz(ctx), sample_rate_hz, block_size);
     }
     dc_accum_init(&ctx->dc_acc, block_size);
 }
@@ -70,16 +143,16 @@ void dpmzm_measure_reset(dpmzm_measure_ctx_t *ctx)
     }
 
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FI)) {
-        goertzel_reset(&ctx->g_fi);
+        reset_goertzel_bank(ctx->g_fi);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FQ)) {
-        goertzel_reset(&ctx->g_fq);
+        reset_goertzel_bank(ctx->g_fq);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FDIFF)) {
-        goertzel_reset(&ctx->g_fdiff);
+        reset_goertzel_bank(ctx->g_fdiff);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FSUM)) {
-        goertzel_reset(&ctx->g_fsum);
+        reset_goertzel_bank(ctx->g_fsum);
     }
     dc_accum_reset(&ctx->dc_acc);
 }
@@ -93,16 +166,16 @@ void dpmzm_measure_process_sample(dpmzm_measure_ctx_t *ctx,
     }
 
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FI)) {
-        goertzel_process_sample(&ctx->g_fi, sample_ac);
+        process_goertzel_bank(ctx->g_fi, sample_ac);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FQ)) {
-        goertzel_process_sample(&ctx->g_fq, sample_ac);
+        process_goertzel_bank(ctx->g_fq, sample_ac);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FDIFF)) {
-        goertzel_process_sample(&ctx->g_fdiff, sample_ac);
+        process_goertzel_bank(ctx->g_fdiff, sample_ac);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FSUM)) {
-        goertzel_process_sample(&ctx->g_fsum, sample_ac);
+        process_goertzel_bank(ctx->g_fsum, sample_ac);
     }
     dc_accum_process(&ctx->dc_acc, sample_dc);
 }
@@ -114,19 +187,19 @@ bool dpmzm_measure_block_ready(const dpmzm_measure_ctx_t *ctx)
     }
 
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FI) &&
-        !goertzel_block_ready(&ctx->g_fi)) {
+        !goertzel_bank_ready(ctx->g_fi)) {
         return false;
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FQ) &&
-        !goertzel_block_ready(&ctx->g_fq)) {
+        !goertzel_bank_ready(ctx->g_fq)) {
         return false;
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FDIFF) &&
-        !goertzel_block_ready(&ctx->g_fdiff)) {
+        !goertzel_bank_ready(ctx->g_fdiff)) {
         return false;
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FSUM) &&
-        !goertzel_block_ready(&ctx->g_fsum)) {
+        !goertzel_bank_ready(ctx->g_fsum)) {
         return false;
     }
 
@@ -136,8 +209,6 @@ bool dpmzm_measure_block_ready(const dpmzm_measure_ctx_t *ctx)
 bool dpmzm_measure_finalize(dpmzm_measure_ctx_t *ctx,
                             dpmzm_measurement_t *out)
 {
-    float phase = 0.0f;
-
     if (ctx == NULL || out == NULL || !dpmzm_measure_block_ready(ctx)) {
         return false;
     }
@@ -148,16 +219,16 @@ bool dpmzm_measure_finalize(dpmzm_measure_ctx_t *ctx,
     out->mag_fsum = 0.0f;
 
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FI)) {
-        goertzel_get_result(&ctx->g_fi, &out->mag_fi, &phase);
+        out->mag_fi = goertzel_bank_max_magnitude(ctx->g_fi);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FQ)) {
-        goertzel_get_result(&ctx->g_fq, &out->mag_fq, &phase);
+        out->mag_fq = goertzel_bank_max_magnitude(ctx->g_fq);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FDIFF)) {
-        goertzel_get_result(&ctx->g_fdiff, &out->mag_fdiff, &phase);
+        out->mag_fdiff = goertzel_bank_max_magnitude(ctx->g_fdiff);
     }
     if (dpmzm_measure_enabled(ctx, DPMZM_MEASURE_FSUM)) {
-        goertzel_get_result(&ctx->g_fsum, &out->mag_fsum, &phase);
+        out->mag_fsum = goertzel_bank_max_magnitude(ctx->g_fsum);
     }
     out->dc_mean = dc_accum_get_mean(&ctx->dc_acc);
     out->sample_count = ctx->block_size;

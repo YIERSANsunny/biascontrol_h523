@@ -61,6 +61,9 @@ static volatile bool s_pilot_dma_contains_p = false;
 static float s_pilot_dma_pending_p_v = 0.0f;
 static volatile uint32_t s_pilot_dma_drop_count = 0U;
 static volatile uint32_t s_pilot_dma_error_count = 0U;
+static volatile uint32_t s_pilot_tim6_irq_count = 0U;
+static volatile uint32_t s_pilot_dma_schedule_count = 0U;
+static uint32_t s_pilot_diag_start_ms = 0U;
 static bool s_capture_pilot_active = false;
 static bool s_scan_reused_continuous_pilot = false;
 static bool s_scan_started_temporary_pilot = false;
@@ -375,6 +378,18 @@ static void reset_pilot_phases(void)
     s_pilot_q_phase_rad = 0.0f;
 }
 
+static void reset_pilot_diag_counters(void)
+{
+    __disable_irq();
+    s_pilot_tim6_irq_count = 0U;
+    s_pilot_dma_schedule_count = 0U;
+    s_pilot_dma_drop_count = 0U;
+    s_pilot_dma_error_count = 0U;
+    __enable_irq();
+
+    s_pilot_diag_start_ms = HAL_GetTick();
+}
+
 static void stop_pilot_timer(void)
 {
     if (s_pilot_timer_running) {
@@ -416,6 +431,7 @@ static bool start_pilot_timer(void)
 
     __HAL_TIM_SET_COUNTER(&htim6, 0U);
     __HAL_TIM_CLEAR_FLAG(&htim6, TIM_FLAG_UPDATE);
+    reset_pilot_diag_counters();
     if (HAL_TIM_Base_Start_IT(&htim6) == HAL_OK) {
         s_pilot_timer_running = true;
         return true;
@@ -521,6 +537,7 @@ static void drive_next_sample_internal(void)
     if (!schedule_pilot_dma_sequence(tone_i_v, tone_q_v, include_p_frame, pending_p_v)) {
         return;
     }
+    s_pilot_dma_schedule_count++;
 
     phase_step_i = (2.0f * M_PI * s_dpmzm_ctx.config->pilot_i_freq_hz) /
                    timer_rate_hz;
@@ -560,8 +577,27 @@ static void print_status(void)
     uint16_t code_i = board_voltage_to_dac_code(s_dpmzm_ctx.bias_i_v);
     uint16_t code_q = board_voltage_to_dac_code(s_dpmzm_ctx.bias_q_v);
     uint16_t code_p = board_voltage_to_dac_code(s_dpmzm_ctx.bias_p_v);
+    uint32_t diag_now_ms = HAL_GetTick();
+    uint32_t diag_elapsed_ms = 0U;
+    uint32_t diag_irq_count = 0U;
+    uint32_t diag_schedule_count = 0U;
+    float diag_irq_rate_hz = 0.0f;
+    float diag_schedule_rate_hz = 0.0f;
 
     s_pilot_timer_rate_hz = pilot_timer_rate_hz;
+    if (s_pilot_diag_start_ms != 0U) {
+        diag_elapsed_ms = diag_now_ms - s_pilot_diag_start_ms;
+    }
+    __disable_irq();
+    diag_irq_count = s_pilot_tim6_irq_count;
+    diag_schedule_count = s_pilot_dma_schedule_count;
+    __enable_irq();
+    if (diag_elapsed_ms > 0U) {
+        diag_irq_rate_hz = ((float)diag_irq_count * 1000.0f) /
+                           (float)diag_elapsed_ms;
+        diag_schedule_rate_hz = ((float)diag_schedule_count * 1000.0f) /
+                                (float)diag_elapsed_ms;
+    }
 
     printf("[dpmzm] status\r\n");
     printf("  initialized: %s\r\n", s_dpmzm_ctx.initialized ? "yes" : "no");
@@ -582,6 +618,8 @@ static void print_status(void)
            (double)board_dac_code_to_dac_pin_voltage(code_q),
            (double)board_dac_code_to_dac_pin_voltage(code_p));
     printf("  note:          status is target/model only, no analog readback\r\n");
+    printf("  adc dsp fs:    %u Hz\r\n",
+           (unsigned)DSP_SAMPLE_RATE_HZ);
     printf("  pilot source:  %s\r\n",
            pilot_source_name(s_dpmzm_ctx.config->pilot_source));
     printf("  pilot output:  %s\r\n",
@@ -591,6 +629,11 @@ static void print_status(void)
            (unsigned long)htim6.State);
     printf("  pilot tim6 fs: %.2f Hz\r\n",
            (double)pilot_timer_rate_hz);
+    printf("  pilot actual:  irq=%.1f Hz sched=%.1f Hz, irq=%lu sched=%lu\r\n",
+           (double)diag_irq_rate_hz,
+           (double)diag_schedule_rate_hz,
+           (unsigned long)diag_irq_count,
+           (unsigned long)diag_schedule_count);
     printf("  pilot I:       %.1f Hz, %.1f mVpp\r\n",
            (double)s_dpmzm_ctx.config->pilot_i_freq_hz,
            (double)(s_dpmzm_ctx.config->pilot_i_amp_v * 2000.0f));
@@ -1086,7 +1129,7 @@ static void handle_auto_coarse(void)
 
     req.sweep_min_v = -9.0f;
     req.sweep_max_v = 9.0f;
-    req.sweep_step_v = 0.1f;
+    req.sweep_step_v = 0.5f;
     fill_auto_scan_template(&req.scan_template);
 
     printf("[dpmzm][auto] coarse start: range=%+.1f..%+.1fV step=%.3f blocks=%lu\r\n",
@@ -1144,10 +1187,9 @@ static void handle_auto_fine(void)
     req.sweep_min_v = -9.0f;
     req.sweep_max_v = 9.0f;
     req.wide_range_v = 2.0f;
-    req.wide_step_v = 0.05f;
+    req.wide_step_v = 0.1f;
     req.p_fine_range_v = 0.6f;
     req.iq_fine_range_v = 0.6f;
-    req.expanded_range_v = 1.0f;
     req.fine_step_v = 0.01f;
 
     printf("[dpmzm][auto] fine start: wide=+/-%0.2fV step=%.3f fineP=+/-%0.2fV fineIQ=+/-%0.2fV step=%.3f blocks=%lu\r\n",
@@ -1743,6 +1785,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 
     if (htim->Instance == TIM6) {
+        s_pilot_tim6_irq_count++;
         drive_next_sample_internal();
     }
 }

@@ -7,13 +7,13 @@
 /*  DSP system parameters                                                    */
 /* ========================================================================= */
 
-/** ADC sample rate in Hz (ADS131M02, OSR=128, HR mode, 8.192 MHz CLKIN) */
+/** ADC sample rate in Hz (ADS131M02, OSR=128, HR mode, measured scan path). */
 #define DSP_SAMPLE_RATE_HZ      32000
 
 /** Pilot tone frequency in Hz */
 #define DSP_PILOT_FREQ_HZ            1000
 
-/** Samples per 1 kHz pilot cycle at 32 kSPS. Must stay integer for coherent detection. */
+/** Samples per 1 kHz pilot cycle at 32 kSPS. */
 #define DSP_PILOT_PERIOD_SAMPLES     32
 
 /** Number of full pilot cycles integrated by each Goertzel block.

@@ -264,7 +264,7 @@ dpmzm capture raw <N> <settle_ms>
 
 ```text
 range: -9.0 V to +9.0 V
-step:  0.1 V
+step:  0.5 V
 blocks: default scan blocks
 ```
 
@@ -273,7 +273,7 @@ blocks: default scan blocks
 - 第一级：宽窗细化，也可以叫中扫，用来把粗扫结果拉到更可靠的局部谷底附近。
 - 第二级：小窗口细扫，用来在第一级结果附近做精确定位。
 
-原因是第一版粗扫步进为 `0.1 V`，再加上 `MATP -> P-QTP -> MITP` 之间存在相互耦合，粗扫点只能保证“落在可用区域”，不应该假设它已经非常接近最终精确点。
+原因是第一版粗扫步进现在调整为 `0.5 V`，主要目标是更快找到可用盆地；再加上 `MATP -> P-QTP -> MITP` 之间存在相互耦合，粗扫点只能保证“落在可用区域”，不应该假设它已经非常接近最终精确点。精确定位交给后续 `auto fine` 的 `0.1 V / 0.01 V` 两级细扫。
 
 ### 9.1 第一级：宽窗细化
 
@@ -283,17 +283,17 @@ blocks: default scan blocks
 P-QTP wide refine:
   center = p_qtp_coarse
   range  = center +/- 2.0 V
-  step   = 0.05 V
+  step   = 0.1 V
 
 I-MITP wide refine:
   center = i_mitp_coarse
   range  = center +/- 2.0 V
-  step   = 0.05 V
+  step   = 0.1 V
 
 Q-MITP wide refine:
   center = q_mitp_coarse
   range  = center +/- 2.0 V
-  step   = 0.05 V
+  step   = 0.1 V
 ```
 
 第一级的目标不是最终精确，而是得到：
@@ -316,23 +316,23 @@ P-QTP fine:
 
 I-MITP fine:
   center = i_mitp_wide_best
-  range  = center +/- 0.3 V to +/- 0.6 V
+  range  = center +/- 0.6 V
   step   = 0.01 V
 
 Q-MITP fine:
   center = q_mitp_wide_best
-  range  = center +/- 0.3 V to +/- 0.6 V
+  range  = center +/- 0.6 V
   step   = 0.01 V
 ```
 
-### 9.3 贴边后的追踪扩窗规则
+### 9.3 贴边后的重心移动规则
 
-如果第二级小窗口细扫的 best point 落在窗口边缘附近，说明真实谷底大概率还在窗口外侧。此时不要继续以旧 center 原地扩窗，而应该：
+如果第二级小窗口细扫的 best point 落在窗口边缘附近，说明真实谷底大概率还在窗口外侧。此时不要继续以旧 center 原地扩大窗口，而应该：
 
 1. 将当前扫描通道偏压设置到这个边缘 best point。
 2. 以这个边缘 best point 作为新的 center。
-3. 执行 expanded fine scan。
-4. 如果 expanded fine scan 仍然贴边，则最多再扩一次，或者返回 `NEED_WIDER_WINDOW`。
+3. 继续执行同样 `+/- 0.6 V`, `0.01 V` 小窗重扫。
+4. 如果第二次仍然贴边，也先接受该窗口内 best point，不在本轮自动细扫里继续阔窗。
 
 建议边缘判定：
 
@@ -351,9 +351,9 @@ I fine:
 
 because best is near right edge:
   set I = 5.7 V
-  I expanded fine:
+  I edge-rescan fine:
     center = 5.7 V
-    range  = +/- 0.6 V or +/- 1.0 V
+    range  = +/- 0.6 V
     step   = 0.01 V
 ```
 
@@ -362,7 +362,7 @@ because best is near right edge:
 - 搜索中心会跟着真实谷底方向移动。
 - 不会浪费一半窗口在已经确认不是最优的方向。
 - 对 `P/I/Q` 三路耦合更友好，因为每一步都会先把当前通道设置到当前最佳点。
-- 如果谷底继续往外，算法也能连续追出去，而不是卡在旧中心附近。
+- 如果谷底继续往外，本轮先接受窗口内 best point，下一轮 `auto fine` 或人工复核再继续追；这样可以避免自动流程在单次运行里无限扩窗。
 
 ---
 
@@ -403,10 +403,10 @@ dpmzm auto fine    ->  在粗初值附近局部精修
 
 - 基于最近一次有效 `dpmzm auto coarse` 结果执行。
 - 如果没有有效 coarse 结果，会拒绝执行并提示先运行 `dpmzm auto coarse`。
-- 第一阶段执行 `P/I/Q` 宽窗细化：`center +/- 2.0 V`，`step = 0.05 V`。
+- 第一阶段执行 `P/I/Q` 宽窗细化：`center +/- 2.0 V`，`step = 0.1 V`。
 - 第二阶段执行 `P/I/Q` 小窗口细扫：`step = 0.01 V`。
-- 小窗口细扫如果贴边，会先把当前通道偏压设置到贴边 best point，再以该点为中心执行 expanded fine scan。
-- 如果 expanded fine scan 仍然贴边，则返回 `NEED_WIDER_WINDOW`。
+- 小窗口细扫如果贴边，会先把当前通道偏压设置到贴边 best point，再以该点为中心用同样 `+/- 0.6 V` 小窗重扫一次。
+- 贴边重扫后不再自动阔窗，也不再因为第二次仍贴边而返回 `NEED_WIDER_WINDOW`。
 - 细扫成功后，固件会自动应用最终 `I/Q/P` 偏压。
 
 当前命令关系：
@@ -420,7 +420,7 @@ dpmzm auto status  ->  查看最近一次 coarse/fine 状态和结果
 下一步需要上板验证：
 
 - `auto fine` 每一段曲线是否和手动细扫一致。
-- 贴边扩窗规则是否会误触发或漏触发。
+- 贴边重心移动规则是否会误触发或漏触发。
 - 细扫总耗时是否可以接受。
 - 是否需要在 `P -> I -> Q` 后自动再重复一轮小窗口细扫。
 
@@ -482,7 +482,7 @@ P = +1.520 V
 
 实验观察上，用户通过光功率计确认该最终点大概率正确。这说明第二版自动细扫得到的 RF 谷底点，已经能和实际光功率工作状态相互印证。
 
-本轮没有触发贴边扩窗：
+本轮没有触发贴边重扫：
 
 ```text
 P expanded = no
@@ -563,12 +563,12 @@ dpmzm auto status
 `auto fine` 的实际流程为：
 
 1. 从最近一次有效 `auto coarse` 结果出发。
-2. 先做 `P-QTP wide`：`center +/- 2.0 V`, `step = 0.05 V`。
+2. 先做 `P-QTP wide`：`center +/- 2.0 V`, `step = 0.1 V`。
 3. 再做 `P-QTP fine`：`center +/- 0.6 V`, `step = 0.01 V`。
 4. 做 `I-MITP wide/fine`。
 5. 做 `Q-MITP wide/fine`。
-6. 因为 `I/Q` 改变会移动 `P-QTP`，最后重新做一次 `P-QTP final global + final fine`。
-7. 小窗口贴边时，先把该通道设置到贴边 best，再以该点为新中心扩窗扫描。
+6. `Q-MITP fine` 结束后直接应用本轮 `P/I/Q` 结果，不再追加 `P-QTP final global`。
+7. 小窗口贴边时，先把该通道设置到贴边 best，再以该点为新中心继续执行同样 `+/- 0.6 V`, `0.01 V` 小窗重扫。
 
 当前结论：
 
@@ -578,7 +578,7 @@ dpmzm auto status
 
 ### 15.2 正 P 分支脚本化复现流程
 
-实验中发现，最终 `P-QTP final global` 单纯按 `2200 Hz` 最深谷底选择时，有时会跳到负 P 分支；但人工确认的正 P 分支在光功率计上更符合当前实验目标。
+实验中发现，早期固件中的 `P-QTP final global` 单纯按 `2200 Hz` 最深谷底选择时，有时会跳到负 P 分支；但人工确认的正 P 分支在光功率计上更符合当前实验目标。因此当前固件已移除 `auto fine` 末尾的 P 全局回扫，优先保留前面 `P-QTP wide/fine` 选中的当前分支。
 
 为保证实验流程可重复，新增脚本：
 
