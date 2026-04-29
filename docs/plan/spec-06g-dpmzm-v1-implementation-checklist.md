@@ -499,3 +499,159 @@ Q expanded = no
 - **V2 自动细扫主流程已经完成第一轮上板验证。**
 - **最终点已经通过光功率计做了定性确认。**
 - **下一步建议先做重复性验证，再进入 V3 闭环小扰动误差构造。**
+
+---
+
+## 14. V3 交接：进入真正闭环控制
+
+基于 2026-04-28 的自动粗扫 + 自动细扫验证，以及光功率计对最终点的定性确认，可以认为第二版已经完成阶段目标。
+
+后续开发重点切换为第三版：
+
+```text
+V3 = 小扰动有符号误差 + 低速闭环守点
+```
+
+第三版不再优先解决全局找点问题，而是基于 `auto fine` 得到的可信工作点，围绕当前偏压做左右小扰动：
+
+```text
+V + delta -> 测指标
+V - delta -> 测指标
+比较两边大小 -> 判断修正方向
+```
+
+初始闭环指标保持简单：
+
+| 通道 | 闭环指标 |
+|---|---|
+| `I` | `fI = 1000 Hz` 最小 |
+| `Q` | `fQ = 1200 Hz` 最小 |
+| `P` | `fI+fQ = 2200 Hz` 最小 |
+
+建议第三版先按下面顺序实现：
+
+1. `dpmzm lock probe p/i/q`：只探测左右方向，不更新偏压。
+2. `dpmzm lock step p/i/q`：执行一次小步更新。
+3. `dpmzm lock start/stop/status`：低速循环守点。
+
+推荐自动循环顺序：
+
+```text
+P -> I -> P -> Q -> P
+```
+
+完整第三版方案见：
+
+- `docs/plan/spec-06i-dpmzm-v3-closed-loop-locking.md`
+
+---
+
+## 15. 2026-04-29 第二版 / 第三版阶段完成记录
+
+2026-04-29 的开发和实验把本文后半部分的计划继续向前推进了一步：第二版自动细扫已经不再只是“待验证”，第三版低速闭环也已经进入可运行状态。
+
+### 15.1 第二版自动细扫完成情况
+
+当前固件已经支持：
+
+```text
+dpmzm auto coarse
+dpmzm auto fine
+dpmzm auto status
+```
+
+`auto fine` 的实际流程为：
+
+1. 从最近一次有效 `auto coarse` 结果出发。
+2. 先做 `P-QTP wide`：`center +/- 2.0 V`, `step = 0.05 V`。
+3. 再做 `P-QTP fine`：`center +/- 0.6 V`, `step = 0.01 V`。
+4. 做 `I-MITP wide/fine`。
+5. 做 `Q-MITP wide/fine`。
+6. 因为 `I/Q` 改变会移动 `P-QTP`，最后重新做一次 `P-QTP final global + final fine`。
+7. 小窗口贴边时，先把该通道设置到贴边 best，再以该点为新中心扩窗扫描。
+
+当前结论：
+
+- V2 的主流程已经完成固件实现。
+- 粗扫 + 细扫可以自动给出一组可用局部候选点。
+- 细扫结果已经能和手动扫描 / 光功率计观察形成定性闭环。
+
+### 15.2 正 P 分支脚本化复现流程
+
+实验中发现，最终 `P-QTP final global` 单纯按 `2200 Hz` 最深谷底选择时，有时会跳到负 P 分支；但人工确认的正 P 分支在光功率计上更符合当前实验目标。
+
+为保证实验流程可重复，新增脚本：
+
+- `tools/run_dpmzm_positive_branch_flow.py`
+
+脚本固定的流程为：
+
+```text
+1. dpmzm lock stop
+2. dpmzm set dump metrics
+3. dpmzm set pilot-open on
+4. set I/Q/P = 0/0/0 V
+5. dpmzm auto coarse
+6. dpmzm auto fine
+7. 从 fine 日志提取第一轮正 P 分支：
+   - FINE_SCAN_P_FINE
+   - FINE_SCAN_I_FINE
+   - FINE_SCAN_Q_FINE
+8. 恢复到该正分支点
+9. 小窗 P-QTP
+10. 小窗 I-MITP
+11. 小窗 Q-MITP
+12. 小窗 P-QTP
+13. dpmzm lock start
+```
+
+脚本默认小窗参数：
+
+```text
+range  = +/- 0.30 V
+step   = 0.01 V
+blocks = 10
+```
+
+重要注意：
+
+- 脚本默认先把三路偏压归零，避免继承上一次实验偏压导致粗扫进入另一条分支。
+- 如需从当前板上状态继续实验，可加 `--skip-initial-bias`。
+- 扫描结束后默认启动闭环；如只想扫描，可加 `--no-lock-at-end`。
+
+### 15.3 第三版闭环控制完成情况
+
+当前新增闭环命令：
+
+```text
+dpmzm lock probe p|i|q
+dpmzm lock step p|i|q
+dpmzm lock start
+dpmzm lock stop
+dpmzm lock status
+```
+
+当前闭环策略：
+
+```text
+axis sequence = P -> I -> P -> Q -> P
+delta         = 0.05 V
+max step      = 0.01 V
+deadband      = 0.03
+settle        = 10 ms
+blocks        = 10
+```
+
+通道判据保持简单：
+
+| 通道 | 目标 | 主判据 |
+|---|---|---|
+| `I` | `I-MITP` | `fI = 1000 Hz` 最小 |
+| `Q` | `Q-MITP` | `fQ = 1200 Hz` 最小 |
+| `P` | `P-QTP` | `fI+fQ = 2200 Hz` 最小 |
+
+当前结论：
+
+- V3 的第一版固件接口已经完成。
+- `lock start` 可以在脚本扫描结束后自动启动。
+- 后续重点从“能否进入闭环”转为“长时间稳定性、分支选择规则和参数整定”。

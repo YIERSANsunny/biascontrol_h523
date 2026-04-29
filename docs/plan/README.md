@@ -18,6 +18,11 @@
 | [spec-06a-dpmzm-migration-checklist](spec-06a-dpmzm-migration-checklist.md) | Draft | DPMZM 改造清单：基于当前 MZM 工程真实代码结构的落地路线 |
 | [spec-06b-dpmzm-parallel-files](spec-06b-dpmzm-parallel-files.md) | Draft | DPMZM 并行新增文件清单：在不破坏原 MZM 主线前提下扩展 |
 | [spec-06c-dpmzm-first-batch-files](spec-06c-dpmzm-first-batch-files.md) | Draft | DPMZM 第一批创建文件清单：先做最小开环实验集合 |
+| [spec-06d-dpmzm-status-overview](spec-06d-dpmzm-status-overview.md) | **V1/V2/V3 active** | DPMZM 功能总览与开发状态 |
+| [spec-06f-dpmzm-closed-loop-strategy](spec-06f-dpmzm-closed-loop-strategy.md) | Strategy | DPMZM 自动寻优与局部闭环总体策略 |
+| [spec-06g-dpmzm-v1-implementation-checklist](spec-06g-dpmzm-v1-implementation-checklist.md) | **V1/V2 COMPLETE** ✅ | 自动粗扫与自动细扫实现、验证和阶段交接 |
+| [spec-06h-dpmzm-v1-code-change-checklist](spec-06h-dpmzm-v1-code-change-checklist.md) | Reference | V1 代码修改清单 |
+| [spec-06i-dpmzm-v3-closed-loop-locking](spec-06i-dpmzm-v3-closed-loop-locking.md) | **V3 IMPLEMENTED** | 第三版小扰动有符号误差与低速闭环锁定方案 |
 
 ## Key Technical Parameters
 
@@ -67,3 +72,23 @@ PD → TIA(OPA140) → ADS131M02 CH0 → Goertzel(f0, 2f0)
 - [spec-06f-dpmzm-closed-loop-strategy](spec-06f-dpmzm-closed-loop-strategy.md): 基于现有开环数据整理的 DPMZM 可行控制方案，区分粗捕获、局部细化与真正闭环
 - [spec-06g-dpmzm-v1-implementation-checklist](spec-06g-dpmzm-v1-implementation-checklist.md): 第一版固件实现清单，只聚焦“板上自动粗捕获”
 - [spec-06h-dpmzm-v1-code-change-checklist](spec-06h-dpmzm-v1-code-change-checklist.md): 第一版代码改动清单，明确当前代码库里要改哪些文件、先加哪些结构体和接口
+- [spec-06i-dpmzm-v3-closed-loop-locking](spec-06i-dpmzm-v3-closed-loop-locking.md): 第三版低速闭环锁定方案与当前固件实现状态
+
+## DPMZM Current Automation
+
+The current validated DPMZM automation path is tracked in:
+
+- `tools/run_dpmzm_positive_branch_flow.py`
+
+It runs:
+
+```text
+initial I/Q/P = 0/0/0 V
+dpmzm auto coarse
+dpmzm auto fine
+restore positive P branch from fine logs
+small P-QTP -> small I-MITP -> small Q-MITP -> small P-QTP
+dpmzm lock start
+```
+
+Use `--no-lock-at-end` when only scan validation is needed, and `--skip-initial-bias` when the current board bias should be preserved before coarse scan.

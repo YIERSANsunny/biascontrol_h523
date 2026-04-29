@@ -90,5 +90,8 @@ bool dpmzm_scan_run_collect(const dpmzm_scan_request_t *req,
                             dpmzm_scan_point_t *points,
                             uint32_t point_capacity,
                             uint32_t *point_count_out);
+bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
+                              float sweep_value,
+                              dpmzm_measurement_t *out);
 
 #endif /* CTRL_SCAN_DPMZM_H */

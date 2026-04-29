@@ -1,5 +1,6 @@
 #include "app_main_dpmzm.h"
 #include "ctrl_auto_dpmzm.h"
+#include "ctrl_lock_dpmzm.h"
 #include "dsp_types.h"
 #include "ctrl_scan_dpmzm.h"
 #include "drv_ads131m02.h"
@@ -33,6 +34,13 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_CAPTURE_SAMPLES_MAX       8192U
 #define DPMZM_CAPTURE_SETTLE_DEFAULT_MS 20U
 #define DPMZM_CAPTURE_DRDY_TIMEOUT_MS   5U
+#define DPMZM_LOCK_DEFAULT_DELTA_V      0.05f
+#define DPMZM_LOCK_DEFAULT_GAIN_V       0.01f
+#define DPMZM_LOCK_DEFAULT_MAX_STEP_V   0.01f
+#define DPMZM_LOCK_DEFAULT_DEADBAND     0.03f
+#define DPMZM_LOCK_DEFAULT_SETTLE_MS    10U
+#define DPMZM_LOCK_DEFAULT_BLOCKS       10U
+#define DPMZM_LOCK_DEFAULT_INTERVAL_MS  500U
 
 /*
  * The pilot phase accumulator must use TIM6's actual update rate. A hardcoded
@@ -56,6 +64,8 @@ static volatile uint32_t s_pilot_dma_error_count = 0U;
 static bool s_capture_pilot_active = false;
 static bool s_scan_reused_continuous_pilot = false;
 static bool s_scan_started_temporary_pilot = false;
+static uint32_t s_lock_last_cycle_ms = 0U;
+static bool s_lock_cycle_busy = false;
 
 typedef struct {
     int32_t ch0_code;
@@ -934,6 +944,136 @@ static void fill_auto_scan_template(dpmzm_scan_request_t *scan_template)
     scan_template->bias_apply_fn = app_dpmzm_scan_apply_bias_triplet;
 }
 
+static void fill_lock_request(dpmzm_lock_request_t *req)
+{
+    if (req == NULL) {
+        return;
+    }
+
+    memset(req, 0, sizeof(*req));
+    fill_auto_scan_template(&req->scan_template);
+    req->scan_template.blocks = DPMZM_LOCK_DEFAULT_BLOCKS;
+    req->scan_template.settle_ms = DPMZM_LOCK_DEFAULT_SETTLE_MS;
+    req->scan_template.dump_mode = DPMZM_SCAN_DUMP_METRICS;
+    req->delta_v = DPMZM_LOCK_DEFAULT_DELTA_V;
+    req->gain_v = DPMZM_LOCK_DEFAULT_GAIN_V;
+    req->max_step_v = DPMZM_LOCK_DEFAULT_MAX_STEP_V;
+    req->deadband_rel = DPMZM_LOCK_DEFAULT_DEADBAND;
+    req->min_bias_v = -10.0f;
+    req->max_bias_v = 10.0f;
+    req->loop_interval_ms = DPMZM_LOCK_DEFAULT_INTERVAL_MS;
+}
+
+static int apply_lock_step_result(const dpmzm_lock_step_result_t *result)
+{
+    float vi = s_dpmzm_ctx.bias_i_v;
+    float vq = s_dpmzm_ctx.bias_q_v;
+    float vp = s_dpmzm_ctx.bias_p_v;
+
+    if (result == NULL || !result->probe.valid) {
+        return -1;
+    }
+
+    switch (result->probe.axis) {
+    case DPMZM_LOCK_AXIS_I:
+        vi = result->new_bias_v;
+        break;
+    case DPMZM_LOCK_AXIS_Q:
+        vq = result->new_bias_v;
+        break;
+    case DPMZM_LOCK_AXIS_P:
+        vp = result->new_bias_v;
+        break;
+    default:
+        return -1;
+    }
+
+    return app_dpmzm_scan_apply_bias_triplet(vi, vq, vp);
+}
+
+static bool run_lock_probe_once(dpmzm_lock_axis_t axis,
+                                dpmzm_lock_probe_result_t *result_out)
+{
+    dpmzm_lock_request_t req;
+    dpmzm_lock_probe_result_t result;
+    bool ok;
+
+    memset(&result, 0, sizeof(result));
+    fill_lock_request(&req);
+
+    if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
+        printf("[dpmzm][lock] probe failed: onboard pilot start failed\r\n");
+        result.axis = axis;
+        result.error_code = DPMZM_LOCK_ERR_MEASURE;
+        if (result_out != NULL) {
+            *result_out = result;
+        }
+        return false;
+    }
+    ok = dpmzm_lock_probe(&req, axis, &result);
+    app_dpmzm_scan_end();
+
+    if (result_out != NULL) {
+        *result_out = result;
+    }
+    if (!ok) {
+        dpmzm_lock_record_fault(result.error_code);
+    }
+    return ok;
+}
+
+static bool run_lock_step_once(dpmzm_lock_axis_t axis,
+                               bool print_result,
+                               dpmzm_lock_step_result_t *result_out)
+{
+    dpmzm_lock_request_t req;
+    dpmzm_lock_step_result_t result;
+    bool ok;
+    int apply_ret = 0;
+
+    memset(&result, 0, sizeof(result));
+    fill_lock_request(&req);
+
+    if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
+        printf("[dpmzm][lock] step failed: onboard pilot start failed\r\n");
+        result.probe.axis = axis;
+        result.error_code = DPMZM_LOCK_ERR_MEASURE;
+        if (result_out != NULL) {
+            *result_out = result;
+        }
+        dpmzm_lock_record_fault(DPMZM_LOCK_ERR_MEASURE);
+        return false;
+    }
+    ok = dpmzm_lock_step(&req, axis, &result);
+    app_dpmzm_scan_end();
+
+    if (ok) {
+        apply_ret = apply_lock_step_result(&result);
+        if (apply_ret != 0) {
+            ok = false;
+            result.error_code = DPMZM_LOCK_ERR_MEASURE;
+        }
+    }
+
+    if (print_result) {
+        dpmzm_lock_print_step_result(&result);
+        if (ok) {
+            printf("[dpmzm][lock] applied step ret=%d\r\n", apply_ret);
+        }
+    }
+
+    if (result_out != NULL) {
+        *result_out = result;
+    }
+
+    if (ok) {
+        dpmzm_lock_record_step(&result);
+    } else {
+        dpmzm_lock_record_fault(result.error_code);
+    }
+    return ok;
+}
+
 static void handle_auto_coarse(void)
 {
     dpmzm_auto_coarse_request_t req;
@@ -1040,6 +1180,78 @@ static void handle_auto_fine(void)
            (double)result.q_mitp_fine_v,
            (double)result.p_qtp_fine_v,
            apply_ret);
+}
+
+static void handle_lock_probe(const char *cmd)
+{
+    dpmzm_lock_axis_t axis;
+    dpmzm_lock_probe_result_t result;
+    const char *arg = cmd + strlen("lock probe ");
+
+    if (!dpmzm_lock_axis_from_char(arg[0], &axis) || arg[1] != '\0') {
+        printf("[dpmzm][lock] usage: lock probe i|q|p\r\n");
+        return;
+    }
+
+    if (run_lock_probe_once(axis, &result)) {
+        dpmzm_lock_print_probe_result(&result);
+    } else {
+        dpmzm_lock_print_probe_result(&result);
+        printf("[dpmzm][lock] probe failed\r\n");
+    }
+}
+
+static void handle_lock_step(const char *cmd)
+{
+    dpmzm_lock_axis_t axis;
+    dpmzm_lock_step_result_t result;
+    const char *arg = cmd + strlen("lock step ");
+
+    if (!dpmzm_lock_axis_from_char(arg[0], &axis) || arg[1] != '\0') {
+        printf("[dpmzm][lock] usage: lock step i|q|p\r\n");
+        return;
+    }
+
+    if (!run_lock_step_once(axis, true, &result)) {
+        printf("[dpmzm][lock] step failed\r\n");
+    }
+}
+
+static void handle_lock_start(void)
+{
+    if (s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD &&
+        !s_dpmzm_ctx.pilot_output_enabled) {
+        handle_set_pilot_open("set pilot-open on");
+        if (!s_dpmzm_ctx.pilot_output_enabled) {
+            printf("[dpmzm][lock] start refused: pilot output failed\r\n");
+            return;
+        }
+    }
+
+    dpmzm_lock_start();
+    s_lock_last_cycle_ms = 0U;
+    printf("[dpmzm][lock] start: sequence P -> I -> P -> Q -> P\r\n");
+}
+
+static void handle_lock_stop(void)
+{
+    dpmzm_lock_stop();
+    printf("[dpmzm][lock] stop\r\n");
+}
+
+static void handle_lock_status(void)
+{
+    dpmzm_lock_request_t req;
+
+    fill_lock_request(&req);
+    dpmzm_lock_print_status();
+    printf("  delta:      %.3fV\r\n", (double)req.delta_v);
+    printf("  gain:       %.3fV\r\n", (double)req.gain_v);
+    printf("  max step:   %.3fV\r\n", (double)req.max_step_v);
+    printf("  deadband:   %.3f\r\n", (double)req.deadband_rel);
+    printf("  blocks:     %lu\r\n", (unsigned long)req.scan_template.blocks);
+    printf("  settle:     %lu ms\r\n", (unsigned long)req.scan_template.settle_ms);
+    printf("  interval:   %lu ms\r\n", (unsigned long)req.loop_interval_ms);
 }
 
 static bool wait_and_read_capture_sample(ads131m02_sample_t *sample_out)
@@ -1256,6 +1468,7 @@ void app_dpmzm_init(void)
 {
     app_config_dpmzm_defaults();
     dpmzm_auto_init();
+    dpmzm_lock_init();
     s_dpmzm_ctx.config = app_config_dpmzm_get();
     s_dpmzm_ctx.bias_i_v = s_dpmzm_ctx.config->bias_i_initial_v;
     s_dpmzm_ctx.bias_q_v = s_dpmzm_ctx.config->bias_q_initial_v;
@@ -1274,12 +1487,37 @@ void app_dpmzm_init(void)
     s_pilot_dma_pending_p_v = s_dpmzm_ctx.bias_p_v;
     s_pilot_dma_drop_count = 0U;
     s_pilot_dma_error_count = 0U;
+    s_lock_last_cycle_ms = 0U;
+    s_lock_cycle_busy = false;
     s_dpmzm_ctx.initialized = true;
 }
 
 void app_dpmzm_run(void)
 {
-    /* Continuous pilot output is driven by TIM6 interrupt. */
+    const dpmzm_lock_context_t *lock_ctx = dpmzm_lock_get_context();
+    dpmzm_lock_request_t req;
+    uint32_t now_ms;
+    dpmzm_lock_axis_t axis;
+
+    if (lock_ctx == NULL || !lock_ctx->enabled || s_lock_cycle_busy) {
+        return;
+    }
+
+    fill_lock_request(&req);
+    now_ms = HAL_GetTick();
+    if (s_lock_last_cycle_ms != 0U &&
+        (now_ms - s_lock_last_cycle_ms) < req.loop_interval_ms) {
+        return;
+    }
+
+    s_lock_cycle_busy = true;
+    axis = dpmzm_lock_next_axis();
+    printf("[dpmzm][lock] cycle axis=%s\r\n", dpmzm_lock_axis_name(axis));
+    if (!run_lock_step_once(axis, true, NULL)) {
+        printf("[dpmzm][lock] cycle stopped by fault\r\n");
+    }
+    s_lock_last_cycle_ms = HAL_GetTick();
+    s_lock_cycle_busy = false;
 }
 
 int app_dpmzm_sync_bias_outputs(void)
@@ -1330,6 +1568,16 @@ void app_dpmzm_handle_command(const char *cmd)
         handle_auto_fine();
     } else if (strcmp(cmd, "auto status") == 0) {
         handle_auto_status();
+    } else if (strncmp(cmd, "lock probe ", 11) == 0) {
+        handle_lock_probe(cmd);
+    } else if (strncmp(cmd, "lock step ", 10) == 0) {
+        handle_lock_step(cmd);
+    } else if (strcmp(cmd, "lock start") == 0) {
+        handle_lock_start();
+    } else if (strcmp(cmd, "lock stop") == 0) {
+        handle_lock_stop();
+    } else if (strcmp(cmd, "lock status") == 0) {
+        handle_lock_status();
     } else if (strncmp(cmd, "scan matp ", 10) == 0 ||
                strncmp(cmd, "scan qtp ", 9) == 0 ||
                strncmp(cmd, "scan mitp ", 10) == 0) {

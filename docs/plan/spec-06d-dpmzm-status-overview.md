@@ -1,6 +1,6 @@
 # Spec 06D - DPMZM 功能总览与开发状态
 
-> 状态：Open-loop scan phase completed; interpretation layer pending
+> 状态：V1 粗扫完成，V2 细扫完成，V3 低速闭环控制已进入固件与脚本验证阶段
 >
 > 用途：用一份文档回答 4 个问题
 > 1. DPMZM 这条线最终要做什么
@@ -29,6 +29,7 @@
 6. `spec-06f-dpmzm-closed-loop-strategy.md`
 7. `spec-06g-dpmzm-v1-implementation-checklist.md`
 8. `spec-06h-dpmzm-v1-code-change-checklist.md`
+9. `spec-06i-dpmzm-v3-closed-loop-locking.md`
 
 ---
 
@@ -576,5 +577,57 @@ DPMZM 通过平行新增文件的方式推进，而不是大面积侵入旧 MZM 
 
 - 开环扫描：已完成
 - 阶段性候选点：已拿到
-- 解释层：未完成
-- 闭环控制：未开始
+- 解释层：粗扫 / 细扫 / 闭环一阶规则已落地，更高层分支选择仍需优化
+- 闭环控制：V3 低速闭环接口已实现，长时间稳定性仍需验证
+
+---
+
+## 11. 2026-04-29 阶段更新：细扫与闭环控制
+
+2026-04-29 的阶段状态已经比本文前半部分更进一步。当前不再只是“开环扫描完成”，而是已经形成了三层可运行能力：
+
+1. `dpmzm auto coarse`：板上自动粗扫，寻找可用初始点。
+2. `dpmzm auto fine`：基于粗扫结果执行宽窗 + 小窗细扫，得到更可信的 `I/Q/P` 局部候选点。
+3. `dpmzm lock probe/step/start/stop/status`：基于小扰动有符号误差做低速闭环守点。
+
+当前固件新增了独立闭环模块：
+
+- `control/inc/ctrl_lock_dpmzm.h`
+- `control/src/ctrl_lock_dpmzm.c`
+
+闭环控制目前采用保守低速策略：
+
+```text
+probe delta      = 0.05 V
+max step         = 0.01 V
+deadband         = 0.03
+lock sequence    = P -> I -> P -> Q -> P
+main metrics     = I:fI, Q:fQ, P:fI+fQ
+```
+
+当前脚本层还固定了一套已经人工验证过的“正 P 分支复现流程”：
+
+```text
+set I/Q/P = 0/0/0 V
+dpmzm auto coarse
+dpmzm auto fine
+restore first positive P branch from fine logs
+small P-QTP -> small I-MITP -> small Q-MITP -> small P-QTP
+dpmzm lock start
+```
+
+对应脚本：
+
+- `tools/run_dpmzm_positive_branch_flow.py`
+- 外部实验副本：`C:\Users\Administrator\Desktop\DPMZM_contral_bais\Python_code\run_dpmzm_positive_branch_flow.py`
+
+这一步的关键经验是：自动流程必须显式规定粗扫起点。若直接继承上一次实验的最终偏压，粗扫可能被带到另一条分支，导致 `auto fine` 在扩窗阶段返回 `NEED_WIDER_WINDOW`。因此脚本默认会先将 `I/Q/P` 归零，再开始粗扫；如需从当前板上状态继续实验，可显式加 `--skip-initial-bias`。
+
+当前阶段判断更新为：
+
+- 开环扫描：已完成。
+- 自动粗扫：已完成并上板验证。
+- 自动细扫：已完成并上板验证。
+- 低速闭环：固件接口已完成，已能由脚本在扫描结束后自动启动。
+- 长时间稳定性：仍需后续连续观测。
+- 分支选择：正 P 分支复现流程已脚本化，固件内部最终 P 全局重扫仍可能选择负分支，需要后续继续优化选择规则。

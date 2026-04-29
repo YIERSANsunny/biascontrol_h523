@@ -327,9 +327,9 @@ static void print_raw_line(const dpmzm_scan_request_t *req,
            (unsigned)DSP_SAMPLE_RATE_HZ);
 }
 
-static bool acquire_point_metrics(const dpmzm_scan_request_t *req,
-                                  float sweep_value,
-                                  dpmzm_measurement_t *out)
+bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
+                              float sweep_value,
+                              dpmzm_measurement_t *out)
 {
     dpmzm_measure_ctx_t measure_ctx;
     dpmzm_tone_gen_t tone_i;
@@ -510,7 +510,7 @@ bool dpmzm_scan_run_collect(const dpmzm_scan_request_t *req,
         float base_vp = 0.0f;
         float primary;
 
-        if (!acquire_point_metrics(req, sweep, &m)) {
+        if (!dpmzm_scan_measure_point(req, sweep, &m)) {
             return false;
         }
 
