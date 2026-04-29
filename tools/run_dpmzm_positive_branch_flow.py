@@ -63,6 +63,19 @@ class AutoFinePicks:
         return BiasPoint(i=float(self.i), q=float(self.q), p=float(self.positive_p))
 
 
+@dataclass
+class MetricRow:
+    stage: str
+    target: str
+    sweep: float
+    blocks: int
+    mag_fi: float
+    mag_fq: float
+    mag_fdiff: float
+    mag_fsum: float
+    dc: float
+
+
 class SerialSession:
     def __init__(self, ser: serial.Serial, log_path: Path, progress_path: Path):
         self.ser = ser
@@ -136,15 +149,24 @@ class SerialSession:
         self.progress(f"{label} timeout after {timeout_s:.0f}s")
         return None
 
-    def wait_scan_done(self, timeout_s: float, label: str) -> float:
+    def wait_scan_done(self, timeout_s: float, label: str, stage: str, axis: str) -> float:
         start = time.time()
         seen = len(self.lines)
         last_progress = start
+        scan_active = False
+        start_pattern = re.compile(
+            rf"\[dpmzm\]\s+scan start:\s+stage={re.escape(stage)}\s+target={re.escape(axis)}\b"
+        )
         best_pattern = re.compile(r"\[dpmzm\]\s+scan done: best .* at ([+-]?\d+\.\d+) V")
 
         while time.time() - start < timeout_s:
             self.read_for(0.25)
             for line in self.lines[seen:]:
+                if start_pattern.search(line):
+                    scan_active = True
+                    continue
+                if not scan_active:
+                    continue
                 if "[dpmzm] scan failed" in line:
                     raise RuntimeError(f"{label} failed")
                 match = best_pattern.search(line)
@@ -173,9 +195,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--startup-wait", type=float, default=0.8)
     parser.add_argument("--coarse-timeout", type=float, default=420.0)
     parser.add_argument("--fine-timeout", type=float, default=780.0)
-    parser.add_argument("--small-window", type=float, default=0.30)
+    parser.add_argument(
+        "--small-window",
+        type=float,
+        default=None,
+        help="Override both P and I/Q final small-window half-widths.",
+    )
+    parser.add_argument("--p-small-window", type=float, default=0.30)
+    parser.add_argument("--iq-small-window", type=float, default=0.10)
     parser.add_argument("--small-step", type=float, default=0.01)
-    parser.add_argument("--blocks", type=int, default=10)
+    parser.add_argument("--iq-blocks", type=int, default=4)
+    parser.add_argument("--p-blocks", type=int, default=6)
+    parser.add_argument("--p-turn-step", type=float, default=0.10)
+    parser.add_argument("--p-turn-window", type=float, default=0.10)
+    parser.add_argument("--p-turn-max-shifts", type=int, default=8)
+    parser.add_argument("--iq-turn-step", type=float, default=0.10)
+    parser.add_argument("--iq-turn-window", type=float, default=0.10)
+    parser.add_argument("--iq-turn-max-shifts", type=int, default=4)
+    parser.add_argument(
+        "--disable-p-turn-search",
+        action="store_true",
+        help="Use the old fixed P small-window scan instead of adaptive P turning-point search.",
+    )
+    parser.add_argument(
+        "--disable-iq-turn-search",
+        action="store_true",
+        help="Use the old fixed I/Q small-window scans instead of adaptive I/Q turning-point search.",
+    )
     parser.add_argument("--initial-i", type=float, default=0.0)
     parser.add_argument("--initial-q", type=float, default=0.0)
     parser.add_argument("--initial-p", type=float, default=0.0)
@@ -183,6 +229,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-initial-bias",
         action="store_true",
         help="Start auto coarse from the board's current I/Q/P biases instead of the default 0/0/0 V.",
+    )
+    parser.add_argument(
+        "--skip-auto-fine",
+        action="store_true",
+        help="Use the auto-coarse result directly, then refine with adaptive turning-point scans.",
     )
     parser.add_argument(
         "--pilot-off-at-end",
@@ -199,6 +250,30 @@ def parse_args() -> argparse.Namespace:
 
 def clamp(value: float, lo: float = -9.0, hi: float = 9.0) -> float:
     return max(lo, min(hi, value))
+
+
+def parse_metric_fields(fields: list[str]) -> MetricRow | None:
+    if len(fields) != len(METRIC_HEADER):
+        return None
+    return MetricRow(
+        stage=fields[0],
+        target=fields[1],
+        sweep=float(fields[2]),
+        blocks=int(float(fields[8])),
+        mag_fi=float(fields[9]),
+        mag_fq=float(fields[10]),
+        mag_fdiff=float(fields[11]),
+        mag_fsum=float(fields[12]),
+        dc=float(fields[13]),
+    )
+
+
+def metric_value(row: MetricRow) -> float:
+    if row.stage == "qtp":
+        return row.mag_fsum
+    if row.target == "q":
+        return row.mag_fq
+    return row.mag_fi
 
 
 def parse_auto_fine_picks(lines: list[str]) -> AutoFinePicks:
@@ -224,11 +299,11 @@ def parse_auto_fine_picks(lines: list[str]) -> AutoFinePicks:
             stage = pick_match.group(1).lower()
             target = pick_match.group(2).lower()
             best = float(pick_match.group(3))
-            if state == "FINE_SCAN_P_FINE" and stage == "qtp" and target == "p":
+            if state in ("FINE_SCAN_P_WIDE", "FINE_SCAN_P_FINE") and stage == "qtp" and target == "p":
                 picks.positive_p = best
-            elif state == "FINE_SCAN_I_FINE" and stage == "mitp" and target == "i":
+            elif state in ("FINE_SCAN_I_WIDE", "FINE_SCAN_I_FINE") and stage == "mitp" and target == "i":
                 picks.i = best
-            elif state == "FINE_SCAN_Q_FINE" and stage == "mitp" and target == "q":
+            elif state in ("FINE_SCAN_Q_WIDE", "FINE_SCAN_Q_FINE") and stage == "mitp" and target == "q":
                 picks.q = best
             continue
 
@@ -241,6 +316,22 @@ def parse_auto_fine_picks(lines: list[str]) -> AutoFinePicks:
             )
 
     return picks
+
+
+def parse_applied_auto_result(lines: list[str], label: str) -> BiasPoint | None:
+    pattern = re.compile(
+        rf"\[dpmzm\]\[auto\]\s+applied {re.escape(label)} result:\s+"
+        r"I=([+-]?\d+\.\d+)V\s+Q=([+-]?\d+\.\d+)V\s+P=([+-]?\d+\.\d+)V"
+    )
+    for line in lines:
+        match = pattern.search(line)
+        if match:
+            return BiasPoint(
+                i=float(match.group(1)),
+                q=float(match.group(2)),
+                p=float(match.group(3)),
+            )
+    return None
 
 
 def scan_and_apply(
@@ -257,7 +348,150 @@ def scan_and_apply(
     command = f"dpmzm scan {stage} {axis} {start_v:.3f} {stop_v:.3f} {step_v:.3f} {blocks}"
     label = f"small {stage}-{axis}"
     session.send(command)
-    best = session.wait_scan_done(timeout_s=180.0, label=label)
+    best = session.wait_scan_done(timeout_s=180.0, label=label, stage=stage, axis=axis)
+    session.send(f"dpmzm set bias {axis} {best:.3f}")
+    session.read_for(1.0)
+    return best
+
+
+def scan_collect(
+    session: SerialSession,
+    stage: str,
+    axis: str,
+    start_v: float,
+    stop_v: float,
+    step_v: float,
+    blocks: int,
+    label: str,
+    timeout_s: float = 180.0,
+) -> tuple[float, list[MetricRow]]:
+    before_metric_count = len(session.metric_rows)
+    command = f"dpmzm scan {stage} {axis} {start_v:.3f} {stop_v:.3f} {step_v:.3f} {blocks}"
+    session.send(command)
+    best = session.wait_scan_done(timeout_s=timeout_s, label=label, stage=stage, axis=axis)
+
+    rows: list[MetricRow] = []
+    for fields in session.metric_rows[before_metric_count:]:
+        row = parse_metric_fields(fields)
+        if row is None:
+            continue
+        if row.stage == stage and row.target == axis:
+            rows.append(row)
+    rows.sort(key=lambda row: row.sweep)
+    return best, rows
+
+
+def scan_and_apply_collect(
+    session: SerialSession,
+    stage: str,
+    axis: str,
+    center_v: float,
+    window_v: float,
+    step_v: float,
+    blocks: int,
+    label: str,
+) -> float:
+    start_v = clamp(center_v - window_v)
+    stop_v = clamp(center_v + window_v)
+    best, _ = scan_collect(session, stage, axis, start_v, stop_v, step_v, blocks, label)
+    session.send(f"dpmzm set bias {axis} {best:.3f}")
+    session.read_for(1.0)
+    return best
+
+
+def turning_point_scan_and_apply(
+    session: SerialSession,
+    stage: str,
+    axis: str,
+    center_v: float,
+    fallback_window_v: float,
+    final_window_v: float,
+    final_step_v: float,
+    turn_step_v: float,
+    max_shifts: int,
+    blocks: int,
+    label_prefix: str,
+) -> float:
+    center = clamp(center_v)
+    bracketed_center: float | None = None
+
+    for attempt in range(max_shifts + 1):
+        probe_center = center
+        if center - turn_step_v < -9.0:
+            probe_center = clamp(-9.0 + turn_step_v)
+        elif center + turn_step_v > 9.0:
+            probe_center = clamp(9.0 - turn_step_v)
+
+        start_v = clamp(probe_center - turn_step_v)
+        stop_v = clamp(probe_center + turn_step_v)
+        label = f"{label_prefix} probe {attempt + 1}"
+        _, rows = scan_collect(session, stage, axis, start_v, stop_v, turn_step_v, blocks, label)
+        if len(rows) < 3:
+            break
+
+        left = rows[0]
+        mid = min(rows, key=lambda row: abs(row.sweep - probe_center))
+        right = rows[-1]
+        left_m = metric_value(left)
+        mid_m = metric_value(mid)
+        right_m = metric_value(right)
+
+        if mid_m <= left_m and mid_m <= right_m:
+            bracketed_center = mid.sweep
+            session.progress(f"{label_prefix} bracketed around {bracketed_center:+.3f}V")
+            break
+
+        best_row = min((left, mid, right), key=metric_value)
+        next_center = clamp(best_row.sweep)
+        direction = "left" if next_center < center else "right"
+        session.progress(
+            f"{label_prefix} moves {direction}: center {center:+.3f}V -> {next_center:+.3f}V"
+        )
+        if abs(next_center - center) < 1e-6:
+            break
+        center = next_center
+
+    if bracketed_center is None:
+        session.progress(f"{label_prefix} fallback: fixed small-window scan")
+        return scan_and_apply_collect(
+            session,
+            stage,
+            axis,
+            center,
+            fallback_window_v,
+            final_step_v,
+            blocks,
+            f"{label_prefix} fallback",
+        )
+
+    best, rows = scan_collect(
+        session,
+        stage,
+        axis,
+        clamp(bracketed_center - final_window_v),
+        clamp(bracketed_center + final_window_v),
+        final_step_v,
+        blocks,
+        f"{label_prefix} fine",
+    )
+
+    if rows:
+        left_edge = min(row.sweep for row in rows)
+        right_edge = max(row.sweep for row in rows)
+        edge_margin = max(final_step_v * 1.5, 0.015)
+        if abs(best - left_edge) <= edge_margin or abs(best - right_edge) <= edge_margin:
+            session.progress(f"{label_prefix} fine best near edge, rescan around {best:+.3f}V")
+            best, _ = scan_collect(
+                session,
+                stage,
+                axis,
+                clamp(best - final_window_v),
+                clamp(best + final_window_v),
+                final_step_v,
+                blocks,
+                f"{label_prefix} fine edge",
+            )
+
     session.send(f"dpmzm set bias {axis} {best:.3f}")
     session.read_for(1.0)
     return best
@@ -315,6 +549,7 @@ def main() -> int:
             session.send("dpmzm status")
             session.read_for(1.0)
 
+        before_coarse_line_count = len(session.lines)
         session.send("dpmzm auto coarse")
         coarse_line = session.wait_for_any(
             ["[dpmzm][auto] applied coarse result", "[dpmzm][auto] coarse failed", "[dpmzm][auto] failed"],
@@ -324,39 +559,109 @@ def main() -> int:
         if coarse_line is None or "failed" in coarse_line:
             return 2
 
-        before_fine_line_count = len(session.lines)
-        session.send("dpmzm auto fine")
-        fine_line = session.wait_for_any(
-            ["[dpmzm][auto] applied fine result", "[dpmzm][auto] fine failed"],
-            args.fine_timeout,
-            "auto fine",
-        )
-        if fine_line is None or "failed" in fine_line:
-            return 3
+        p_small_window = args.small_window if args.small_window is not None else args.p_small_window
+        iq_small_window = args.small_window if args.small_window is not None else args.iq_small_window
 
-        picks = parse_auto_fine_picks(session.lines[before_fine_line_count:])
-        if not picks.complete():
-            session.progress("failed to parse positive-branch P/I/Q picks from auto fine")
-            return 4
-
-        branch = picks.positive_branch()
-        session.progress(
-            f"positive branch from auto fine: I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
-        )
-        if picks.applied_final is not None:
+        if args.skip_auto_fine:
+            branch = parse_applied_auto_result(session.lines[before_coarse_line_count:], "coarse")
+            if branch is None:
+                session.progress("failed to parse I/Q/P seed from auto coarse")
+                return 4
             session.progress(
-                f"auto fine final ignored: I={picks.applied_final.i:+.3f}V "
-                f"Q={picks.applied_final.q:+.3f}V P={picks.applied_final.p:+.3f}V"
+                f"turn-search seed from auto coarse: I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
             )
+        else:
+            before_fine_line_count = len(session.lines)
+            session.send("dpmzm auto fine")
+            fine_line = session.wait_for_any(
+                ["[dpmzm][auto] applied fine result", "[dpmzm][auto] fine failed"],
+                args.fine_timeout,
+                "auto fine",
+            )
+            if fine_line is None or "failed" in fine_line:
+                return 3
+
+            picks = parse_auto_fine_picks(session.lines[before_fine_line_count:])
+            if not picks.complete():
+                session.progress("failed to parse positive-branch P/I/Q picks from auto fine")
+                return 4
+
+            branch = picks.positive_branch()
+            session.progress(
+                f"positive branch from auto fine: I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
+            )
+            if picks.applied_final is not None:
+                session.progress(
+                    f"auto fine final ignored: I={picks.applied_final.i:+.3f}V "
+                    f"Q={picks.applied_final.q:+.3f}V P={picks.applied_final.p:+.3f}V"
+                )
 
         for axis, value in (("i", branch.i), ("q", branch.q), ("p", branch.p)):
             session.send(f"dpmzm set bias {axis} {value:.3f}")
             session.read_for(1.0)
 
-        branch.p = scan_and_apply(session, "qtp", "p", branch.p, args.small_window, args.small_step, args.blocks)
-        branch.i = scan_and_apply(session, "mitp", "i", branch.i, args.small_window, args.small_step, args.blocks)
-        branch.q = scan_and_apply(session, "mitp", "q", branch.q, args.small_window, args.small_step, args.blocks)
-        branch.p = scan_and_apply(session, "qtp", "p", branch.p, args.small_window, args.small_step, args.blocks)
+        if args.disable_p_turn_search:
+            branch.p = scan_and_apply(session, "qtp", "p", branch.p, p_small_window, args.small_step, args.p_blocks)
+        else:
+            branch.p = turning_point_scan_and_apply(
+                session,
+                "qtp",
+                "p",
+                branch.p,
+                p_small_window,
+                args.p_turn_window,
+                args.small_step,
+                args.p_turn_step,
+                args.p_turn_max_shifts,
+                args.p_blocks,
+                "p-turn",
+            )
+        if args.disable_iq_turn_search:
+            branch.i = scan_and_apply(session, "mitp", "i", branch.i, iq_small_window, args.small_step, args.iq_blocks)
+            branch.q = scan_and_apply(session, "mitp", "q", branch.q, iq_small_window, args.small_step, args.iq_blocks)
+        else:
+            branch.i = turning_point_scan_and_apply(
+                session,
+                "mitp",
+                "i",
+                branch.i,
+                iq_small_window,
+                args.iq_turn_window,
+                args.small_step,
+                args.iq_turn_step,
+                args.iq_turn_max_shifts,
+                args.iq_blocks,
+                "i-turn",
+            )
+            branch.q = turning_point_scan_and_apply(
+                session,
+                "mitp",
+                "q",
+                branch.q,
+                iq_small_window,
+                args.iq_turn_window,
+                args.small_step,
+                args.iq_turn_step,
+                args.iq_turn_max_shifts,
+                args.iq_blocks,
+                "q-turn",
+            )
+        if args.disable_p_turn_search:
+            branch.p = scan_and_apply(session, "qtp", "p", branch.p, p_small_window, args.small_step, args.p_blocks)
+        else:
+            branch.p = turning_point_scan_and_apply(
+                session,
+                "qtp",
+                "p",
+                branch.p,
+                p_small_window,
+                args.p_turn_window,
+                args.small_step,
+                args.p_turn_step,
+                args.p_turn_max_shifts,
+                args.p_blocks,
+                "p-turn",
+            )
 
         if not args.no_lock_at_end:
             session.progress("starting closed-loop bias control")

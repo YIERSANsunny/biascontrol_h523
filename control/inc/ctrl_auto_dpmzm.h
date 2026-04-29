@@ -73,6 +73,8 @@ typedef struct {
     float sweep_min_v;
     float sweep_max_v;
     float sweep_step_v;
+    uint32_t iq_blocks;
+    uint32_t p_blocks;
 } dpmzm_auto_coarse_request_t;
 
 typedef struct {
@@ -99,6 +101,8 @@ typedef struct {
     float p_fine_range_v;
     float iq_fine_range_v;
     float fine_step_v;
+    uint32_t iq_blocks;
+    uint32_t p_blocks;
 } dpmzm_auto_fine_request_t;
 
 typedef struct {

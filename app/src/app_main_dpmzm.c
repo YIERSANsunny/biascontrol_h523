@@ -1131,12 +1131,15 @@ static void handle_auto_coarse(void)
     req.sweep_max_v = 9.0f;
     req.sweep_step_v = 0.5f;
     fill_auto_scan_template(&req.scan_template);
+    req.iq_blocks = 4U;
+    req.p_blocks = 6U;
 
-    printf("[dpmzm][auto] coarse start: range=%+.1f..%+.1fV step=%.3f blocks=%lu\r\n",
+    printf("[dpmzm][auto] coarse start: range=%+.1f..%+.1fV step=%.3f blocks IQ=%lu P=%lu\r\n",
            (double)req.sweep_min_v,
            (double)req.sweep_max_v,
            (double)req.sweep_step_v,
-           (unsigned long)req.scan_template.blocks);
+           (unsigned long)req.iq_blocks,
+           (unsigned long)req.p_blocks);
 
     if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
         printf("[dpmzm][auto] failed: onboard pilot start failed\r\n");
@@ -1187,18 +1190,18 @@ static void handle_auto_fine(void)
     req.sweep_min_v = -9.0f;
     req.sweep_max_v = 9.0f;
     req.wide_range_v = 2.0f;
-    req.wide_step_v = 0.1f;
+    req.wide_step_v = 0.2f;
     req.p_fine_range_v = 0.6f;
     req.iq_fine_range_v = 0.6f;
     req.fine_step_v = 0.01f;
+    req.iq_blocks = 4U;
+    req.p_blocks = 6U;
 
-    printf("[dpmzm][auto] fine start: wide=+/-%0.2fV step=%.3f fineP=+/-%0.2fV fineIQ=+/-%0.2fV step=%.3f blocks=%lu\r\n",
+    printf("[dpmzm][auto] fine start: wide-only +/-%0.2fV step=%.3f blocks IQ=%lu P=%lu\r\n",
            (double)req.wide_range_v,
            (double)req.wide_step_v,
-           (double)req.p_fine_range_v,
-           (double)req.iq_fine_range_v,
-           (double)req.fine_step_v,
-           (unsigned long)req.scan_template.blocks);
+           (unsigned long)req.iq_blocks,
+           (unsigned long)req.p_blocks);
 
     if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
         printf("[dpmzm][auto] fine failed: onboard pilot start failed\r\n");
