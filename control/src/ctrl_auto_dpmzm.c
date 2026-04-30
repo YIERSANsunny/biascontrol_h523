@@ -13,10 +13,20 @@
 #define DPMZM_AUTO_MIN_SEPARATION_MULTIPLIER  6.0f
 #define DPMZM_AUTO_MIN_SEPARATION_ABS_V       0.8f
 #define DPMZM_AUTO_EDGE_MARGIN_POINTS         5U
+#define DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS    2U
+#define DPMZM_AUTO_EDGE_VALLEY_RISE_DB        4.0f
+#define DPMZM_AUTO_QTP_SPIKE_REJECT_DB        18.0f
 #define DPMZM_AUTO_DBM_FLOOR_MW               1e-15f
 
 static dpmzm_auto_context_t s_auto_ctx;
 static dpmzm_scan_point_t s_scan_points[DPMZM_AUTO_SCAN_POINTS_MAX];
+
+typedef struct {
+    uint32_t point_index;
+    float bias_v;
+    bool valid;
+    bool virtual_edge;
+} dpmzm_matp_anchor_t;
 
 static const char *auto_state_name(dpmzm_auto_state_t state)
 {
@@ -145,6 +155,13 @@ static float smoothed_metric_dbm(dpmzm_scan_stage_t stage,
     }
 
     return (n > 0U) ? (sum_dbm / (float)n) : -120.0f;
+}
+
+static bool scan_candidate_index_allowed(uint32_t point_count, uint32_t index)
+{
+    return point_count > (2U * DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS) &&
+           index >= DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS &&
+           (index + DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS) < point_count;
 }
 
 static uint32_t expected_point_count(float start_v, float stop_v, float step_v)
@@ -294,22 +311,6 @@ static void sort_matp_by_metric(dpmzm_matp_candidate_t *candidates, uint32_t cou
     }
 }
 
-static void sort_matp_by_bias(dpmzm_matp_candidate_t *candidates, uint32_t count)
-{
-    uint32_t i;
-    uint32_t j;
-
-    for (i = 0U; i < count; i++) {
-        for (j = i + 1U; j < count; j++) {
-            if (candidates[j].bias_v < candidates[i].bias_v) {
-                dpmzm_matp_candidate_t tmp = candidates[i];
-                candidates[i] = candidates[j];
-                candidates[j] = tmp;
-            }
-        }
-    }
-}
-
 static void sort_mitp_by_metric(dpmzm_mitp_candidate_t *candidates, uint32_t count)
 {
     uint32_t i;
@@ -433,7 +434,9 @@ static uint32_t extract_matp_candidates(const dpmzm_scan_point_t *points,
         raw_count = 0U;
         memset(raw, 0, sizeof(raw));
 
-        for (i = 1U; i + 1U < point_count; i++) {
+        for (i = DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS;
+             i + DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS < point_count;
+             i++) {
             float m1 = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP, target, points, point_count, i - 1U);
             float c0 = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP, target, points, point_count, i);
             float p1 = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP, target, points, point_count, i + 1U);
@@ -618,6 +621,240 @@ static bool pick_sensitive_region_fallback(const dpmzm_scan_point_t *points,
     return main_region->valid;
 }
 
+static void sort_matp_anchors_by_index(dpmzm_matp_anchor_t *anchors, uint32_t count)
+{
+    uint32_t i;
+    uint32_t j;
+
+    for (i = 0U; i < count; i++) {
+        for (j = i + 1U; j < count; j++) {
+            if (anchors[j].point_index < anchors[i].point_index) {
+                dpmzm_matp_anchor_t tmp = anchors[i];
+                anchors[i] = anchors[j];
+                anchors[j] = tmp;
+            }
+        }
+    }
+}
+
+static bool anchor_far_enough(uint32_t index,
+                              const dpmzm_matp_anchor_t *anchors,
+                              uint32_t count,
+                              uint32_t min_sep_points)
+{
+    uint32_t i;
+
+    for (i = 0U; i < count; i++) {
+        uint32_t existing = anchors[i].point_index;
+        uint32_t delta = (index > existing) ? (index - existing) : (existing - index);
+
+        if (delta <= min_sep_points) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static float best_smoothed_metric_dbm(const dpmzm_scan_point_t *points,
+                                      uint32_t point_count,
+                                      dpmzm_scan_target_t target,
+                                      uint32_t left_idx,
+                                      uint32_t right_idx)
+{
+    float best = -FLT_MAX;
+    uint32_t i;
+
+    for (i = left_idx; i <= right_idx; i++) {
+        float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
+                                           target,
+                                           points,
+                                           point_count,
+                                           i);
+        if (metric > best) {
+            best = metric;
+        }
+    }
+
+    return best;
+}
+
+static bool edge_looks_like_truncated_valley(const dpmzm_scan_point_t *points,
+                                             uint32_t point_count,
+                                             dpmzm_scan_target_t target,
+                                             uint32_t edge_idx,
+                                             uint32_t inner_idx,
+                                             float best_metric_dbm)
+{
+    float edge_metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
+                                           target,
+                                           points,
+                                           point_count,
+                                           edge_idx);
+    float inner_metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
+                                            target,
+                                            points,
+                                            point_count,
+                                            inner_idx);
+
+    return (inner_metric - edge_metric) >= DPMZM_AUTO_EDGE_VALLEY_RISE_DB &&
+           (best_metric_dbm - edge_metric) >= DPMZM_AUTO_EDGE_VALLEY_RISE_DB;
+}
+
+static uint32_t build_matp_anchors_with_edges(const dpmzm_scan_point_t *points,
+                                              uint32_t point_count,
+                                              dpmzm_scan_target_t target,
+                                              const dpmzm_matp_candidate_t *matp_candidates,
+                                              uint32_t matp_count,
+                                              dpmzm_matp_anchor_t *anchors,
+                                              uint32_t anchor_capacity)
+{
+    uint32_t count = 0U;
+    uint32_t i;
+    uint32_t left_idx;
+    uint32_t right_idx;
+    uint32_t inner_idx;
+    float best_metric;
+
+    if (points == NULL || matp_candidates == NULL || anchors == NULL ||
+        point_count <= (2U * DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS + 1U) ||
+        anchor_capacity == 0U) {
+        return 0U;
+    }
+
+    memset(anchors, 0, sizeof(*anchors) * anchor_capacity);
+
+    for (i = 0U; i < matp_count && count < anchor_capacity; i++) {
+        if (!matp_candidates[i].valid ||
+            matp_candidates[i].point_index >= point_count) {
+            continue;
+        }
+        anchors[count].point_index = matp_candidates[i].point_index;
+        anchors[count].bias_v = matp_candidates[i].bias_v;
+        anchors[count].valid = true;
+        anchors[count].virtual_edge = false;
+        count++;
+    }
+
+    left_idx = DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS;
+    right_idx = point_count - 1U - DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS;
+    best_metric = best_smoothed_metric_dbm(points, point_count, target, left_idx, right_idx);
+
+    inner_idx = left_idx + DPMZM_AUTO_EDGE_MARGIN_POINTS;
+    if (inner_idx > right_idx) {
+        inner_idx = right_idx;
+    }
+    if (count < anchor_capacity &&
+        anchor_far_enough(left_idx, anchors, count, DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS) &&
+        edge_looks_like_truncated_valley(points, point_count, target, left_idx, inner_idx, best_metric)) {
+        anchors[count].point_index = left_idx;
+        anchors[count].bias_v = points[left_idx].sweep_v;
+        anchors[count].valid = true;
+        anchors[count].virtual_edge = true;
+        count++;
+    }
+
+    inner_idx = (right_idx > DPMZM_AUTO_EDGE_MARGIN_POINTS)
+                    ? (right_idx - DPMZM_AUTO_EDGE_MARGIN_POINTS)
+                    : left_idx;
+    if (inner_idx < left_idx) {
+        inner_idx = left_idx;
+    }
+    if (count < anchor_capacity &&
+        anchor_far_enough(right_idx, anchors, count, DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS) &&
+        edge_looks_like_truncated_valley(points, point_count, target, right_idx, inner_idx, best_metric)) {
+        anchors[count].point_index = right_idx;
+        anchors[count].bias_v = points[right_idx].sweep_v;
+        anchors[count].valid = true;
+        anchors[count].virtual_edge = true;
+        count++;
+    }
+
+    sort_matp_anchors_by_index(anchors, count);
+    return count;
+}
+
+static bool build_plateau_region_between_anchors(const dpmzm_scan_point_t *points,
+                                                 uint32_t point_count,
+                                                 dpmzm_scan_target_t target,
+                                                 const dpmzm_matp_anchor_t *left_anchor,
+                                                 const dpmzm_matp_anchor_t *right_anchor,
+                                                 dpmzm_sensitive_region_t *region)
+{
+    uint32_t left_idx;
+    uint32_t right_idx;
+    uint32_t search_left;
+    uint32_t search_right;
+    uint32_t peak_idx;
+    uint32_t j;
+    float peak_metric = -FLT_MAX;
+
+    if (points == NULL || left_anchor == NULL || right_anchor == NULL || region == NULL) {
+        return false;
+    }
+    if (!left_anchor->valid || !right_anchor->valid) {
+        return false;
+    }
+    if (right_anchor->point_index <= left_anchor->point_index + 1U ||
+        right_anchor->point_index >= point_count) {
+        return false;
+    }
+
+    left_idx = left_anchor->point_index;
+    right_idx = right_anchor->point_index;
+    search_left = left_idx + 1U;
+    search_right = right_idx - 1U;
+    peak_idx = search_left;
+
+    for (j = search_left; j <= search_right; j++) {
+        float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
+                                           target,
+                                           points,
+                                           point_count,
+                                           j);
+        if (metric > peak_metric) {
+            peak_metric = metric;
+            peak_idx = j;
+        }
+    }
+
+    memset(region, 0, sizeof(*region));
+    region->left_matp_v = left_anchor->bias_v;
+    region->right_matp_v = right_anchor->bias_v;
+    region->plateau_peak_dbm = peak_metric;
+    region->plateau_left_v = points[peak_idx].sweep_v;
+    region->plateau_right_v = points[peak_idx].sweep_v;
+
+    for (j = peak_idx; j > left_idx; j--) {
+        float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
+                                           target,
+                                           points,
+                                           point_count,
+                                           j - 1U);
+        if ((peak_metric - metric) > DPMZM_AUTO_PLATEAU_DROP_DB) {
+            break;
+        }
+        region->plateau_left_v = points[j - 1U].sweep_v;
+    }
+
+    for (j = peak_idx; j < right_idx; j++) {
+        float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
+                                           target,
+                                           points,
+                                           point_count,
+                                           j + 1U);
+        if ((peak_metric - metric) > DPMZM_AUTO_PLATEAU_DROP_DB) {
+            break;
+        }
+        region->plateau_right_v = points[j + 1U].sweep_v;
+    }
+
+    region->plateau_center_v = 0.5f * (region->plateau_left_v + region->plateau_right_v);
+    region->plateau_width_v = region->plateau_right_v - region->plateau_left_v;
+    region->valid = true;
+    return true;
+}
+
 static bool pick_sensitive_regions(const dpmzm_scan_point_t *points,
                                    uint32_t point_count,
                                    dpmzm_matp_candidate_t *matp_candidates,
@@ -627,6 +864,8 @@ static bool pick_sensitive_regions(const dpmzm_scan_point_t *points,
                                    dpmzm_sensitive_region_t *main_region,
                                    dpmzm_sensitive_region_t *backup_region)
 {
+    dpmzm_matp_anchor_t anchors[DPMZM_AUTO_MATP_CANDIDATES_MAX + 2U];
+    uint32_t anchor_count;
     dpmzm_sensitive_region_t best = {0};
     dpmzm_sensitive_region_t second = {0};
     uint32_t i;
@@ -637,7 +876,14 @@ static bool pick_sensitive_regions(const dpmzm_scan_point_t *points,
     if (points == NULL || matp_candidates == NULL || matp_count == 0U) {
         return false;
     }
-    if (matp_count < 2U) {
+    anchor_count = build_matp_anchors_with_edges(points,
+                                                 point_count,
+                                                 target,
+                                                 matp_candidates,
+                                                 matp_count,
+                                                 anchors,
+                                                 (uint32_t)(sizeof(anchors) / sizeof(anchors[0])));
+    if (anchor_count < 2U) {
         return pick_sensitive_region_fallback(points,
                                               point_count,
                                               target,
@@ -648,66 +894,17 @@ static bool pick_sensitive_regions(const dpmzm_scan_point_t *points,
                                               backup_region);
     }
 
-    sort_matp_by_bias(matp_candidates, matp_count);
-    for (i = 0U; i + 1U < matp_count; i++) {
-        uint32_t left_idx = matp_candidates[i].point_index;
-        uint32_t right_idx = matp_candidates[i + 1U].point_index;
-        uint32_t j;
-        uint32_t peak_idx = left_idx;
-        float peak_metric = -FLT_MAX;
+    for (i = 0U; i + 1U < anchor_count; i++) {
         dpmzm_sensitive_region_t region;
 
-        if (right_idx <= left_idx + 1U || right_idx >= point_count) {
+        if (!build_plateau_region_between_anchors(points,
+                                                  point_count,
+                                                  target,
+                                                  &anchors[i],
+                                                  &anchors[i + 1U],
+                                                  &region)) {
             continue;
         }
-
-        memset(&region, 0, sizeof(region));
-        region.left_matp_v = matp_candidates[i].bias_v;
-        region.right_matp_v = matp_candidates[i + 1U].bias_v;
-
-        for (j = left_idx; j <= right_idx; j++) {
-            float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
-                                               target,
-                                               points,
-                                               point_count,
-                                               j);
-            if (metric > peak_metric) {
-                peak_metric = metric;
-                peak_idx = j;
-            }
-        }
-
-        region.plateau_peak_dbm = peak_metric;
-        region.plateau_left_v = points[peak_idx].sweep_v;
-        region.plateau_right_v = points[peak_idx].sweep_v;
-
-        for (j = peak_idx; j > left_idx; j--) {
-            float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
-                                               target,
-                                               points,
-                                               point_count,
-                                               j - 1U);
-            if ((peak_metric - metric) > DPMZM_AUTO_PLATEAU_DROP_DB) {
-                break;
-            }
-            region.plateau_left_v = points[j - 1U].sweep_v;
-        }
-
-        for (j = peak_idx; j < right_idx; j++) {
-            float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MATP,
-                                               target,
-                                               points,
-                                               point_count,
-                                               j + 1U);
-            if ((peak_metric - metric) > DPMZM_AUTO_PLATEAU_DROP_DB) {
-                break;
-            }
-            region.plateau_right_v = points[j + 1U].sweep_v;
-        }
-
-        region.plateau_center_v = 0.5f * (region.plateau_left_v + region.plateau_right_v);
-        region.plateau_width_v = region.plateau_right_v - region.plateau_left_v;
-        region.valid = true;
 
         if (!best.valid || region.plateau_peak_dbm > best.plateau_peak_dbm) {
             second = best;
@@ -738,32 +935,80 @@ static bool qtp_curve_usable(const dpmzm_scan_point_t *points, uint32_t point_co
     float min_metric = FLT_MAX;
     float max_metric = -FLT_MAX;
     uint32_t i;
+    uint32_t usable_count = 0U;
 
-    if (points == NULL || point_count == 0U) {
+    if (points == NULL || point_count <= (2U * DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS)) {
         return false;
     }
 
-    for (i = 0U; i < point_count; i++) {
-        float metric = metric_dbm_from_point(DPMZM_SCAN_STAGE_QTP,
-                                             DPMZM_SCAN_TARGET_P,
-                                             &points[i]);
+    for (i = DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS;
+         i + DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS < point_count;
+         i++) {
+        float metric = smoothed_metric_dbm(DPMZM_SCAN_STAGE_QTP,
+                                           DPMZM_SCAN_TARGET_P,
+                                           points,
+                                           point_count,
+                                           i);
         if (metric < min_metric) {
             min_metric = metric;
         }
         if (metric > max_metric) {
             max_metric = metric;
         }
+        usable_count++;
     }
 
-    return (max_metric - min_metric) >= DPMZM_AUTO_MIN_QTP_RANGE_DB;
+    return usable_count >= 3U &&
+           (max_metric - min_metric) >= DPMZM_AUTO_MIN_QTP_RANGE_DB;
 }
 
-static bool pick_qtp_best_point(const dpmzm_scan_point_t *points,
-                                uint32_t point_count,
-                                float *best_p_v)
+static bool qtp_candidate_score_dbm(const dpmzm_scan_point_t *points,
+                                    uint32_t point_count,
+                                    uint32_t index,
+                                    float *score_dbm)
+{
+    float prev_metric;
+    float metric;
+    float next_metric;
+
+    if (points == NULL || score_dbm == NULL ||
+        !scan_candidate_index_allowed(point_count, index)) {
+        return false;
+    }
+
+    prev_metric = metric_dbm_from_point(DPMZM_SCAN_STAGE_QTP,
+                                        DPMZM_SCAN_TARGET_P,
+                                        &points[index - 1U]);
+    metric = metric_dbm_from_point(DPMZM_SCAN_STAGE_QTP,
+                                   DPMZM_SCAN_TARGET_P,
+                                   &points[index]);
+    next_metric = metric_dbm_from_point(DPMZM_SCAN_STAGE_QTP,
+                                        DPMZM_SCAN_TARGET_P,
+                                        &points[index + 1U]);
+
+    /*
+     * A true QTP valley should be supported by neighbouring points. A single
+     * bin that drops far below both neighbours is usually an ADC/settle/noise
+     * dropout and must not steal the automatic P-branch decision.
+     */
+    if ((prev_metric - metric) >= DPMZM_AUTO_QTP_SPIKE_REJECT_DB &&
+        (next_metric - metric) >= DPMZM_AUTO_QTP_SPIKE_REJECT_DB) {
+        return false;
+    }
+
+    *score_dbm = (prev_metric + metric + next_metric) / 3.0f;
+    return true;
+}
+
+static bool pick_qtp_best_point_scored(const dpmzm_scan_point_t *points,
+                                       uint32_t point_count,
+                                       float *best_p_v,
+                                       float *best_score_dbm,
+                                       uint32_t *best_index_out)
 {
     float best_metric = FLT_MAX;
     float best_value = 0.0f;
+    uint32_t best_index = 0U;
     uint32_t i;
 
     if (points == NULL || point_count == 0U || best_p_v == NULL) {
@@ -771,17 +1016,41 @@ static bool pick_qtp_best_point(const dpmzm_scan_point_t *points,
     }
 
     for (i = 0U; i < point_count; i++) {
-        float metric = metric_dbm_from_point(DPMZM_SCAN_STAGE_QTP,
-                                             DPMZM_SCAN_TARGET_P,
-                                             &points[i]);
+        float metric = 0.0f;
+
+        if (!qtp_candidate_score_dbm(points, point_count, i, &metric)) {
+            continue;
+        }
         if (metric < best_metric) {
             best_metric = metric;
             best_value = points[i].sweep_v;
+            best_index = i;
         }
     }
 
+    if (best_metric == FLT_MAX) {
+        return false;
+    }
+
     *best_p_v = best_value;
+    if (best_score_dbm != NULL) {
+        *best_score_dbm = best_metric;
+    }
+    if (best_index_out != NULL) {
+        *best_index_out = best_index;
+    }
     return true;
+}
+
+static bool pick_qtp_best_point(const dpmzm_scan_point_t *points,
+                                uint32_t point_count,
+                                float *best_p_v)
+{
+    return pick_qtp_best_point_scored(points,
+                                      point_count,
+                                      best_p_v,
+                                      NULL,
+                                      NULL);
 }
 
 static uint32_t extract_mitp_candidates(const dpmzm_scan_point_t *points,
@@ -850,7 +1119,9 @@ static uint32_t extract_mitp_candidates(const dpmzm_scan_point_t *points,
         raw_count = 0U;
         memset(raw, 0, sizeof(raw));
 
-        for (i = 1U; i + 1U < point_count; i++) {
+        for (i = DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS;
+             i + DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS < point_count;
+             i++) {
             float m1 = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MITP, target, points, point_count, i - 1U);
             float c0 = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MITP, target, points, point_count, i);
             float p1 = smoothed_metric_dbm(DPMZM_SCAN_STAGE_MITP, target, points, point_count, i + 1U);
@@ -985,13 +1256,28 @@ static bool pick_best_point(dpmzm_scan_stage_t stage,
         return false;
     }
 
+    if (stage == DPMZM_SCAN_STAGE_QTP && target == DPMZM_SCAN_TARGET_P) {
+        return pick_qtp_best_point_scored(points,
+                                          point_count,
+                                          best_bias_v,
+                                          best_metric_dbm,
+                                          best_index_out);
+    }
+
     for (i = 0U; i < point_count; i++) {
         float metric = metric_dbm_from_point(stage, target, &points[i]);
+        if (!scan_candidate_index_allowed(point_count, i)) {
+            continue;
+        }
         if (metric < best_metric) {
             best_metric = metric;
             best_bias = points[i].sweep_v;
             best_index = i;
         }
+    }
+
+    if (best_metric == FLT_MAX) {
+        return false;
     }
 
     *best_bias_v = best_bias;

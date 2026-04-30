@@ -561,3 +561,104 @@ dpmzm lock status
 - **V3 第一版低速闭环固件已经完成。**
 - **自动扫描结束后自动进入闭环的实验脚本已经完成。**
 - **下一阶段重点是长时间稳定性和参数整定，而不是继续补基础接口。**
+
+---
+
+## 15. 2026-04-30 阶段性实验进展
+
+### 15.1 自动找点流程修正
+
+本轮主要解决自动粗扫/细扫阶段的分支选择和异常点问题。
+
+固件侧已经做了以下修正：
+
+- `MATP` 候选点提取不再允许扫描边缘点直接成为候选点，避免 `-9 V / +9 V` 这类边界异常点抢走结果。
+- 当粗扫窗口只看到一个真实 `MATP` 谷底时，允许把“边缘截断谷底”作为虚拟锚点，用于提取两个谷底之间的平台区。
+- `QTP-P` 候选点增加邻点一致性判断，避免单点噪声、ADC 异常或 settle 异常造成的尖锐假谷底。
+- `P-QTP` 默认 blocks 从 `6` 提高到 `10`，以提高 2200 Hz 交调项的重复性。
+
+这轮修改后的自动流程能够更稳定地回到正 P 分支附近，而不是频繁被负支路或边缘异常点带走。
+
+### 15.2 代表性自动扫描结果
+
+2026-04-30 使用 `P blocks = 10` 跑完整自动流程，最终点为：
+
+```text
+I = +5.440 V
+Q = -5.470 V
+P = +1.640 V
+```
+
+该流程包括：
+
+```text
+auto coarse
+auto fine
+P turning-point search
+I turning-point search
+Q turning-point search
+P turning-point search
+dpmzm lock start
+```
+
+对应数据：
+
+```text
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_170005_dpmzm_positive_branch_flow_serial.log
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_170005_dpmzm_positive_branch_flow_metrics.csv
+```
+
+### 15.3 90 秒闭环观察
+
+自动找点结束后，进入低速闭环并记录 90 秒。结果：
+
+```text
+I: span = 21.532 mV, mean_abs_step = 1.460 mV
+Q: span = 12.443 mV, mean_abs_step = 0.794 mV
+P: span =  5.506 mV, mean_abs_step = 0.463 mV
+```
+
+初步判断：
+
+- `P` 路误差已经基本围绕 0 摆动，表现接近“守住 QTP”。
+- `I/Q` 路仍有小幅单向修正，说明入口点或闭环参数仍需优化。
+
+### 15.4 5 分钟闭环观察
+
+继续记录 5 分钟闭环状态。结果：
+
+```text
+I: drift = -37.383 mV, span = 37.383 mV, mean_abs_step = 0.684 mV
+Q: drift = +13.308 mV, span = 13.308 mV, mean_abs_step = 0.242 mV
+P: drift = -14.040 mV, span = 16.525 mV, mean_abs_step = 0.517 mV
+```
+
+对应数据：
+
+```text
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_171230_dpmzm_lock_stability_5min_serial.log
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_171230_dpmzm_lock_stability_5min_steps.csv
+```
+
+实验现象：
+
+- `P` 路有正负方向的闭环修正，说明它基本在 QTP 附近来回守点。
+- `Q` 路漂移较小，部分更新已经落入死区。
+- `I` 路仍然持续往负方向修正，说明 I 路进入闭环时大概率还没有完全落在 MITP 谷底中心。
+- 光谱仪上观察到载波最好和最差约相差 `5 dB`，与 `I/Q` 慢漂现象一致。
+
+### 15.5 当前结论
+
+当前阶段可以认为：
+
+- 自动粗扫、自动细扫和脚本小窗口复现流程已经基本跑通。
+- 低速闭环已经能运行，并且没有观察到发散。
+- `P` 路闭环效果最好，是当前最接近“锁住”的一路。
+- `I/Q` 路还需要优化闭环入口点和闭环策略，尤其是 I 路仍有单向慢漂。
+
+下一步建议优先验证：
+
+1. 进入闭环前，对最终 `I/Q/P` 再做一次 `+/-0.1 V, 0.01 V` 小窗口复查。
+2. 闭环前 60 秒只修 `I/Q`，让 `I/Q` 先稳定，再启用完整 `P -> I -> P -> Q -> P`。
+3. 如果某一路连续多次同方向修正，则触发局部重扫，而不是让它慢慢爬。
+4. 将 `I/Q` 的闭环更新从左右差分升级为三点二次拟合谷底估计。

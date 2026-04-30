@@ -1132,7 +1132,7 @@ static void handle_auto_coarse(void)
     req.sweep_step_v = 0.5f;
     fill_auto_scan_template(&req.scan_template);
     req.iq_blocks = 4U;
-    req.p_blocks = 6U;
+    req.p_blocks = 10U;
 
     printf("[dpmzm][auto] coarse start: range=%+.1f..%+.1fV step=%.3f blocks IQ=%lu P=%lu\r\n",
            (double)req.sweep_min_v,
@@ -1195,7 +1195,7 @@ static void handle_auto_fine(void)
     req.iq_fine_range_v = 0.6f;
     req.fine_step_v = 0.01f;
     req.iq_blocks = 4U;
-    req.p_blocks = 6U;
+    req.p_blocks = 10U;
 
     printf("[dpmzm][auto] fine start: wide-only +/-%0.2fV step=%.3f blocks IQ=%lu P=%lu\r\n",
            (double)req.wide_range_v,
