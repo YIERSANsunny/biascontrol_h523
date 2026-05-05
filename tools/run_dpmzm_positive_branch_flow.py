@@ -204,6 +204,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p-small-window", type=float, default=0.30)
     parser.add_argument("--iq-small-window", type=float, default=0.10)
     parser.add_argument("--small-step", type=float, default=0.01)
+    parser.add_argument("--prelock-iq-recheck-window", type=float, default=0.10)
+    parser.add_argument("--prelock-iq-recheck-step", type=float, default=0.01)
+    parser.add_argument(
+        "--disable-prelock-iq-recheck",
+        action="store_true",
+        help="Skip the final +/- window I/Q MITP recheck before starting closed-loop control.",
+    )
     parser.add_argument("--iq-blocks", type=int, default=4)
     parser.add_argument("--p-blocks", type=int, default=6)
     parser.add_argument("--p-turn-step", type=float, default=0.10)
@@ -661,6 +668,33 @@ def main() -> int:
                 args.p_turn_max_shifts,
                 args.p_blocks,
                 "p-turn",
+            )
+
+        if not args.disable_prelock_iq_recheck:
+            session.progress(
+                "pre-lock I/Q recheck: "
+                f"+/-{args.prelock_iq_recheck_window:.3f}V "
+                f"step={args.prelock_iq_recheck_step:.3f}V"
+            )
+            branch.i = scan_and_apply_collect(
+                session,
+                "mitp",
+                "i",
+                branch.i,
+                args.prelock_iq_recheck_window,
+                args.prelock_iq_recheck_step,
+                args.iq_blocks,
+                "pre-lock I recheck",
+            )
+            branch.q = scan_and_apply_collect(
+                session,
+                "mitp",
+                "q",
+                branch.q,
+                args.prelock_iq_recheck_window,
+                args.prelock_iq_recheck_step,
+                args.iq_blocks,
+                "pre-lock Q recheck",
             )
 
         if not args.no_lock_at_end:

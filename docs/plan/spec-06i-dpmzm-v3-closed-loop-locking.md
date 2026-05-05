@@ -658,7 +658,74 @@ C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_171230_dpm
 
 下一步建议优先验证：
 
-1. 进入闭环前，对最终 `I/Q/P` 再做一次 `+/-0.1 V, 0.01 V` 小窗口复查。
+1. 进入闭环前，对最终 `I/Q` 再做一次 `+/-0.1 V, 0.01 V` 小窗口复查。
 2. 闭环前 60 秒只修 `I/Q`，让 `I/Q` 先稳定，再启用完整 `P -> I -> P -> Q -> P`。
 3. 如果某一路连续多次同方向修正，则触发局部重扫，而不是让它慢慢爬。
 4. 将 `I/Q` 的闭环更新从左右差分升级为三点二次拟合谷底估计。
+
+### 15.6 已落实：锁定前 I/Q 小窗口复查
+
+2026-04-30 已在脚本流程中加入锁定前 `I/Q` 复查：
+
+```text
+final P-QTP turning search
+pre-lock I-MITP recheck: center = current I, range = +/-0.1 V, step = 0.01 V
+pre-lock Q-MITP recheck: center = current Q, range = +/-0.1 V, step = 0.01 V
+dpmzm lock start
+```
+
+对应脚本：
+
+```text
+tools/run_dpmzm_positive_branch_flow.py
+```
+
+新增参数：
+
+```text
+--prelock-iq-recheck-window  默认 0.10
+--prelock-iq-recheck-step    默认 0.01
+--disable-prelock-iq-recheck 用于回退旧流程做 A/B 对比
+```
+
+这一步的目的不是重新大范围找点，而是确认最终进入闭环前 `I/Q` 没有落在局部小窗边缘，并尽量减少进入闭环后的单向慢漂。
+
+### 15.7 复现验证：未再观察到错误分支锁定
+
+锁定前 `I/Q` 小窗口复查加入后，连续两轮完整脚本流程均回到期望的正 `P` 分支附近，没有再观察到此前 `P` 路被带到约 `-7 V` 负支路的错误锁定现象。
+
+代表性结果：
+
+```text
+2026-04-30_173402:
+I = +5.180 V
+Q = -5.380 V
+P = +1.530 V
+
+2026-04-30_174224:
+I = +5.190 V
+Q = -5.390 V
+P = +1.490 V
+```
+
+第二轮进入闭环后的首次 probe 表现为：
+
+```text
+P: error = -0.340914, step = +3.409 mV
+I: error = +0.151876, step = -1.519 mV
+Q: error = -0.011694, hold
+```
+
+阶段判断：
+
+- 正 `P` 分支复现流程已经比前一版稳定。
+- 锁定前 `I/Q` 小窗口复查有效减少了进入闭环时的 `I/Q` 初始偏离。
+- 当前仍需继续观察长时间光谱稳定性，尤其是光谱仪上载波最好/最差约 `5 dB` 差异对应的慢漂来源。
+
+对应数据：
+
+```text
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_173402_dpmzm_positive_branch_flow_serial.log
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_174224_dpmzm_positive_branch_flow_serial.log
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\simulation_image\auto_flow\2026-04-30_174224_dpmzm_positive_branch_flow_all_stages.png
+```
