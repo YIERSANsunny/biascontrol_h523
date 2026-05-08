@@ -20,6 +20,7 @@ except ImportError as exc:
 
 
 RAW_DATA_DIR = Path(r"C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data")
+SIM_IMAGE_DIR = Path(r"C:\Users\Administrator\Desktop\DPMZM_contral_bais\simulation_image\auto_flow")
 METRIC_PREFIX = "DPMZMCSV,"
 
 METRIC_HEADER = [
@@ -74,6 +75,20 @@ class MetricRow:
     mag_fdiff: float
     mag_fsum: float
     dc: float
+
+
+@dataclass
+class ProbeMetric:
+    metric: float
+    dbm: float
+    center_best: bool = False
+    direction: str = ""
+
+
+@dataclass
+class AnchorGuardAxisState:
+    direction_streak: int = 0
+    degrade_streak: int = 0
 
 
 class SerialSession:
@@ -192,6 +207,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", default="COM9")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--output-dir", type=Path, default=RAW_DATA_DIR)
+    parser.add_argument("--plot-dir", type=Path, default=SIM_IMAGE_DIR)
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Skip plotting the all-stages PNG after the scan finishes.",
+    )
     parser.add_argument("--startup-wait", type=float, default=0.8)
     parser.add_argument("--coarse-timeout", type=float, default=420.0)
     parser.add_argument("--fine-timeout", type=float, default=780.0)
@@ -204,7 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p-small-window", type=float, default=0.30)
     parser.add_argument("--iq-small-window", type=float, default=0.10)
     parser.add_argument("--small-step", type=float, default=0.01)
-    parser.add_argument("--prelock-iq-recheck-window", type=float, default=0.10)
+    parser.add_argument("--prelock-iq-recheck-window", type=float, default=0.08)
     parser.add_argument("--prelock-iq-recheck-step", type=float, default=0.01)
     parser.add_argument(
         "--disable-prelock-iq-recheck",
@@ -252,6 +273,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not start closed-loop bias control after the final scan. Default starts it.",
     )
+    parser.add_argument(
+        "--anchor-guard-duration",
+        type=float,
+        default=0.0,
+        help=(
+            "After lock start, run script-side I/Q anchor guard for this many seconds. "
+            "Default disables post-lock guard monitoring."
+        ),
+    )
+    parser.add_argument("--anchor-guard-interval", type=float, default=30.0)
+    parser.add_argument("--anchor-guard-first-delay", type=float, default=5.0)
+    parser.add_argument(
+        "--anchor-guard-degrade-db",
+        type=float,
+        default=8.0,
+        help=(
+            "Count one severe-degrade event when center metric worsens by this many dB. "
+            "A recheck is triggered only after consecutive events."
+        ),
+    )
+    parser.add_argument("--anchor-guard-direction-count", type=int, default=2)
+    parser.add_argument("--anchor-guard-degrade-count", type=int, default=2)
+    parser.add_argument("--anchor-guard-iq-window", type=float, default=0.08)
+    parser.add_argument("--anchor-guard-iq-step", type=float, default=0.01)
+    parser.add_argument("--anchor-guard-p-window", type=float, default=0.12)
+    parser.add_argument("--anchor-guard-p-step", type=float, default=0.01)
     return parser.parse_args()
 
 
@@ -404,6 +451,221 @@ def scan_and_apply_collect(
     session.send(f"dpmzm set bias {axis} {best:.3f}")
     session.read_for(1.0)
     return best
+
+
+def probe_axis_center(session: SerialSession, axis: str, label: str) -> ProbeMetric:
+    start = time.time()
+    seen = len(session.lines)
+    saw_probe = False
+    metric_pattern = re.compile(r"metric0:\s+([0-9.]+)\s+\(([+-]?\d+\.\d+) dBm\).*best=(yes|no)")
+    direction_pattern = re.compile(r"e:\s+[+-]?\d+\.\d+\s+direction=([A-Za-z0-9_-]+)")
+    metric: float | None = None
+    dbm: float | None = None
+    center_best = False
+
+    session.send(f"dpmzm lock probe {axis}")
+    while time.time() - start < 30.0:
+        session.read_for(0.25)
+        for line in session.lines[seen:]:
+            if f"[dpmzm][lock] probe axis={axis}" in line:
+                saw_probe = True
+                continue
+            if not saw_probe:
+                continue
+            match = metric_pattern.search(line)
+            if match:
+                metric = float(match.group(1))
+                dbm = float(match.group(2))
+                center_best = match.group(3) == "yes"
+                continue
+            direction_match = direction_pattern.search(line)
+            if direction_match and metric is not None and dbm is not None:
+                direction = direction_match.group(1)
+                session.progress(
+                    f"{label}: {axis.upper()} metric0={metric:.9f} "
+                    f"({dbm:+.2f} dBm) best={'yes' if center_best else 'no'} "
+                    f"direction={direction}"
+                )
+                return ProbeMetric(
+                    metric=metric,
+                    dbm=dbm,
+                    center_best=center_best,
+                    direction=direction,
+                )
+        seen = len(session.lines)
+    raise TimeoutError(f"{label}: timeout waiting for lock probe {axis}")
+
+
+def refresh_iq_anchor_baseline(session: SerialSession, label: str) -> dict[str, ProbeMetric]:
+    return {
+        "i": probe_axis_center(session, "i", label),
+        "q": probe_axis_center(session, "q", label),
+    }
+
+
+def anchor_direction_valid(probe: ProbeMetric) -> bool:
+    return probe.direction in ("hold", "hold-center", "hold-weak")
+
+
+def update_anchor_baseline(old: ProbeMetric, current: ProbeMetric, alpha: float = 0.25) -> ProbeMetric:
+    return ProbeMetric(
+        metric=current.metric,
+        dbm=old.dbm + alpha * (current.dbm - old.dbm),
+        center_best=current.center_best,
+        direction=current.direction,
+    )
+
+
+def stop_lock_and_wait(session: SerialSession, label: str) -> bool:
+    session.send("dpmzm lock stop")
+    line = session.wait_for_any(["[dpmzm][lock] stop"], 30.0, label)
+    session.read_for(0.5)
+    return line is not None
+
+
+def recheck_anchor_axes(
+    session: SerialSession,
+    branch: BiasPoint,
+    args: argparse.Namespace,
+    axes: list[str],
+    label_prefix: str,
+) -> dict[str, ProbeMetric]:
+    if "i" in axes:
+        branch.i = scan_and_apply_collect(
+            session,
+            "mitp",
+            "i",
+            branch.i,
+            args.anchor_guard_iq_window,
+            args.anchor_guard_iq_step,
+            args.iq_blocks,
+            f"{label_prefix} I recheck",
+        )
+    if "q" in axes:
+        branch.q = scan_and_apply_collect(
+            session,
+            "mitp",
+            "q",
+            branch.q,
+            args.anchor_guard_iq_window,
+            args.anchor_guard_iq_step,
+            args.iq_blocks,
+            f"{label_prefix} Q recheck",
+        )
+
+    branch.p = scan_and_apply_collect(
+        session,
+        "qtp",
+        "p",
+        branch.p,
+        args.anchor_guard_p_window,
+        args.anchor_guard_p_step,
+        args.p_blocks,
+        f"{label_prefix} P recheck",
+    )
+    return refresh_iq_anchor_baseline(session, f"{label_prefix} baseline refresh")
+
+
+def run_anchor_guard(
+    session: SerialSession,
+    branch: BiasPoint,
+    args: argparse.Namespace,
+    baseline: dict[str, ProbeMetric],
+) -> None:
+    if args.anchor_guard_duration <= 0.0:
+        return
+
+    start = time.time()
+    next_check = start + max(0.0, args.anchor_guard_first_delay)
+    guard_state = {
+        "i": AnchorGuardAxisState(),
+        "q": AnchorGuardAxisState(),
+    }
+    session.progress(
+        "anchor guard start: "
+        f"duration={args.anchor_guard_duration:.0f}s "
+        f"interval={args.anchor_guard_interval:.0f}s "
+        f"threshold={args.anchor_guard_degrade_db:.1f}dB "
+        f"direction_count={args.anchor_guard_direction_count} "
+        f"degrade_count={args.anchor_guard_degrade_count}"
+    )
+
+    while time.time() - start < args.anchor_guard_duration:
+        wait_s = min(0.5, max(0.0, next_check - time.time()))
+        if wait_s > 0:
+            session.read_for(wait_s)
+            continue
+
+        session.progress("anchor guard check: pause P lock and probe I/Q")
+        if not stop_lock_and_wait(session, "anchor guard stop lock"):
+            session.progress("anchor guard stop not confirmed; skip probe to avoid command overwrite")
+            session.send("dpmzm lock start")
+            session.read_for(0.8)
+            next_check += args.anchor_guard_interval
+            continue
+
+        try:
+            current = refresh_iq_anchor_baseline(session, "anchor guard probe")
+        except TimeoutError as exc:
+            session.progress(f"anchor guard probe skipped: {exc}")
+            session.send("dpmzm lock start")
+            session.read_for(1.0)
+            next_check += args.anchor_guard_interval
+            continue
+        triggered_axes: list[str] = []
+        for axis in ("i", "q"):
+            degrade_db = current[axis].dbm - baseline[axis].dbm
+            off_valley = not anchor_direction_valid(current[axis])
+            severe_degrade = degrade_db >= args.anchor_guard_degrade_db
+            state = guard_state[axis]
+            state.direction_streak = state.direction_streak + 1 if off_valley else 0
+            state.degrade_streak = state.degrade_streak + 1 if severe_degrade else 0
+            session.progress(
+                f"anchor {axis.upper()}: current={current[axis].dbm:+.2f} dBm "
+                f"baseline={baseline[axis].dbm:+.2f} dBm degrade={degrade_db:+.2f} dB "
+                f"direction={current[axis].direction} "
+                f"dir_streak={state.direction_streak} deg_streak={state.degrade_streak}"
+            )
+            if state.direction_streak >= args.anchor_guard_direction_count:
+                triggered_axes.append(axis)
+            elif state.degrade_streak >= args.anchor_guard_degrade_count:
+                triggered_axes.append(axis)
+
+        if triggered_axes:
+            session.progress("anchor guard triggered: " + ",".join(axis.upper() for axis in triggered_axes))
+            try:
+                baseline = recheck_anchor_axes(session, branch, args, triggered_axes, "anchor")
+                for confirm_round in range(2):
+                    off_axes = [
+                        axis for axis in ("i", "q")
+                        if not anchor_direction_valid(baseline[axis])
+                    ]
+                    if not off_axes:
+                        break
+                    session.progress(
+                        "anchor guard post-recheck confirm triggered: " +
+                        ",".join(axis.upper() for axis in off_axes)
+                    )
+                    baseline = recheck_anchor_axes(
+                        session,
+                        branch,
+                        args,
+                        off_axes,
+                        f"anchor confirm {confirm_round + 1}",
+                    )
+                for axis in ("i", "q"):
+                    guard_state[axis] = AnchorGuardAxisState()
+            except TimeoutError as exc:
+                session.progress(f"anchor guard baseline refresh failed: {exc}")
+        else:
+            for axis in ("i", "q"):
+                if anchor_direction_valid(current[axis]):
+                    baseline[axis] = update_anchor_baseline(baseline[axis], current[axis])
+            session.progress("anchor guard: I/Q anchors still valid, no recheck")
+
+        session.send("dpmzm lock start")
+        session.read_for(1.0)
+        next_check += args.anchor_guard_interval
 
 
 def turning_point_scan_and_apply(
@@ -697,12 +959,38 @@ def main() -> int:
                 "pre-lock Q recheck",
             )
 
+        anchor_baseline: dict[str, ProbeMetric] | None = None
+        if args.anchor_guard_duration > 0.0:
+            if args.no_lock_at_end:
+                session.progress("anchor guard requested but --no-lock-at-end is set; guard disabled")
+            else:
+                session.progress("anchor guard baseline capture before lock start")
+                anchor_baseline = refresh_iq_anchor_baseline(session, "anchor guard baseline")
+                off_axes = [
+                    axis for axis in ("i", "q")
+                    if not anchor_direction_valid(anchor_baseline[axis])
+                ]
+                if off_axes:
+                    session.progress(
+                        "anchor guard pre-lock baseline needs recheck: " +
+                        ",".join(axis.upper() for axis in off_axes)
+                    )
+                    anchor_baseline = recheck_anchor_axes(
+                        session,
+                        branch,
+                        args,
+                        off_axes,
+                        "anchor pre-lock",
+                    )
+
         if not args.no_lock_at_end:
             session.progress("starting closed-loop bias control")
             session.send("dpmzm lock start")
             session.read_for(1.0)
             session.send("dpmzm lock status")
             session.read_for(2.0)
+            if anchor_baseline is not None:
+                run_anchor_guard(session, branch, args, anchor_baseline)
 
         session.send("dpmzm status")
         session.read_for(2.0)
@@ -720,6 +1008,19 @@ def main() -> int:
         )
         session.progress(f"serial log saved: {log_path}")
         session.progress(f"metrics csv saved: {metrics_path}")
+        if not args.no_plot:
+            try:
+                from plot_dpmzm_flow_metrics import plot_flow_metrics
+
+                image_path = args.plot_dir / f"{stem}_all_stages.png"
+                plot_flow_metrics(
+                    metrics_path,
+                    out_path=image_path,
+                    title=f"DPMZM positive-branch flow ({stamp})",
+                )
+                session.progress(f"all-stages plot saved: {image_path}")
+            except Exception as exc:
+                session.progress(f"plot failed: {exc!r}")
         return 0
 
 

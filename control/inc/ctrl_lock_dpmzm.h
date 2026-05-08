@@ -43,13 +43,17 @@ typedef struct {
     float center_v;
     float plus_v;
     float minus_v;
+    float metric_center;
     float metric_plus;
     float metric_minus;
+    float metric_center_dbm;
     float metric_plus_dbm;
     float metric_minus_dbm;
     float error;
+    float dc_center_v;
     float dc_plus_v;
     float dc_minus_v;
+    bool center_is_best;
     const char *direction;
     dpmzm_lock_error_t error_code;
 } dpmzm_lock_probe_result_t;

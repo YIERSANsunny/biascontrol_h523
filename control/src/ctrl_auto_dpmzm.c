@@ -16,6 +16,8 @@
 #define DPMZM_AUTO_SCAN_EDGE_REJECT_POINTS    2U
 #define DPMZM_AUTO_EDGE_VALLEY_RISE_DB        4.0f
 #define DPMZM_AUTO_QTP_SPIKE_REJECT_DB        18.0f
+#define DPMZM_AUTO_QTP_POSITIVE_MARGIN_DB     3.0f
+#define DPMZM_AUTO_MITP_DC_SELECT_WINDOW_DB   3.0f
 #define DPMZM_AUTO_DBM_FLOOR_MW               1e-15f
 
 static dpmzm_auto_context_t s_auto_ctx;
@@ -1009,6 +1011,9 @@ static bool pick_qtp_best_point_scored(const dpmzm_scan_point_t *points,
     float best_metric = FLT_MAX;
     float best_value = 0.0f;
     uint32_t best_index = 0U;
+    float best_positive_metric = FLT_MAX;
+    float best_positive_value = 0.0f;
+    uint32_t best_positive_index = 0U;
     uint32_t i;
 
     if (points == NULL || point_count == 0U || best_p_v == NULL) {
@@ -1026,10 +1031,29 @@ static bool pick_qtp_best_point_scored(const dpmzm_scan_point_t *points,
             best_value = points[i].sweep_v;
             best_index = i;
         }
+        if (points[i].sweep_v >= 0.0f && metric < best_positive_metric) {
+            best_positive_metric = metric;
+            best_positive_value = points[i].sweep_v;
+            best_positive_index = i;
+        }
     }
 
     if (best_metric == FLT_MAX) {
         return false;
+    }
+
+    /*
+     * The positive-branch workflow should not jump to the negative P-QTP branch
+     * just because two nearly equivalent QTP valleys differ by a fraction of a
+     * dB in one coarse scan. Prefer the best positive-P valley when it is close
+     * enough to the global best; still allow the negative branch if the positive
+     * valley is clearly worse.
+     */
+    if (best_positive_metric != FLT_MAX &&
+        best_positive_metric <= (best_metric + DPMZM_AUTO_QTP_POSITIVE_MARGIN_DB)) {
+        best_metric = best_positive_metric;
+        best_value = best_positive_value;
+        best_index = best_positive_index;
     }
 
     *best_p_v = best_value;
@@ -1168,6 +1192,9 @@ static bool pick_mitp_branch(const dpmzm_scan_point_t *points,
     dpmzm_mitp_candidate_t candidates[DPMZM_AUTO_MITP_CANDIDATES_MAX];
     uint32_t candidate_count;
     uint32_t selected_index = 0U;
+    float selected_dc = FLT_MAX;
+    float selected_raw_dbm = FLT_MAX;
+    uint32_t i;
 
     if (best_bias_v == NULL) {
         return false;
@@ -1183,9 +1210,32 @@ static bool pick_mitp_branch(const dpmzm_scan_point_t *points,
         return false;
     }
 
-    if (candidate_count >= 2U && candidates[1U].dc_mean_v < candidates[0U].dc_mean_v) {
-        selected_index = 1U;
+    printf("[dpmzm][auto] %s-MITP candidates:",
+           dpmzm_scan_target_name(target));
+    for (i = 0U; i < candidate_count; i++) {
+        float raw_dbm = metric_dbm_from_point(DPMZM_SCAN_STAGE_MITP,
+                                              target,
+                                              &points[candidates[i].point_index]);
+        printf(" %+.3fV(raw=%.2fdBm,smooth=%.2fdBm,dc=%.6f)",
+               (double)candidates[i].bias_v,
+               (double)raw_dbm,
+               (double)candidates[i].metric_f1_dbm,
+               (double)candidates[i].dc_mean_v);
+
+        /* Once a point is a real MITP valley, DC decides the branch. RF depth
+         * only breaks near-ties so a shallow-but-valid low-DC branch is kept. */
+        if (candidates[i].dc_mean_v < selected_dc ||
+            (fabsf(candidates[i].dc_mean_v - selected_dc) < 1e-6f &&
+             raw_dbm < selected_raw_dbm)) {
+            selected_index = i;
+            selected_dc = candidates[i].dc_mean_v;
+            selected_raw_dbm = raw_dbm;
+        }
     }
+
+    printf(" -> select %+.3fV\r\n",
+           (double)candidates[selected_index].bias_v);
+
     candidates[selected_index].selected_as_mitp = true;
     *best_bias_v = candidates[selected_index].bias_v;
     return true;

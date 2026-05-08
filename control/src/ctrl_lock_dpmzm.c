@@ -5,13 +5,16 @@
 #include <string.h>
 
 #define DPMZM_LOCK_DBM_FLOOR_MW 1e-15f
+/*
+ * A side probe must be convincingly better than the center point before the
+ * loop is allowed to move. This keeps small measurement asymmetry/noise from
+ * being integrated into a slow bias drift.
+ */
+#define DPMZM_LOCK_MIN_SIDE_IMPROVEMENT_REL 0.20f
 
 static dpmzm_lock_context_t s_lock_ctx;
+/* V3.1 anchor-guard trial: keep I/Q as scan anchors, continuously guard P-QTP only. */
 static const dpmzm_lock_axis_t s_lock_sequence[] = {
-    DPMZM_LOCK_AXIS_P,
-    DPMZM_LOCK_AXIS_I,
-    DPMZM_LOCK_AXIS_P,
-    DPMZM_LOCK_AXIS_Q,
     DPMZM_LOCK_AXIS_P
 };
 
@@ -272,6 +275,7 @@ bool dpmzm_lock_probe(const dpmzm_lock_request_t *req,
                       dpmzm_lock_probe_result_t *out)
 {
     dpmzm_scan_request_t point_req;
+    dpmzm_measurement_t center_m;
     dpmzm_measurement_t plus_m;
     dpmzm_measurement_t minus_m;
     float center_v;
@@ -313,22 +317,61 @@ bool dpmzm_lock_probe(const dpmzm_lock_request_t *req,
         (void)apply_center_biases(&point_req);
         return false;
     }
+    if (!dpmzm_scan_measure_point(&point_req, center_v, &center_m)) {
+        out->error_code = DPMZM_LOCK_ERR_MEASURE;
+        (void)apply_center_biases(&point_req);
+        return false;
+    }
 
     (void)apply_center_biases(&point_req);
 
+    out->metric_center = metric_for_axis(axis, &center_m);
     out->metric_plus = metric_for_axis(axis, &plus_m);
     out->metric_minus = metric_for_axis(axis, &minus_m);
+    out->metric_center_dbm = metric_to_dbm(out->metric_center);
     out->metric_plus_dbm = metric_to_dbm(out->metric_plus);
     out->metric_minus_dbm = metric_to_dbm(out->metric_minus);
+    out->dc_center_v = center_m.dc_mean;
     out->dc_plus_v = plus_m.dc_mean;
     out->dc_minus_v = minus_m.dc_mean;
 
-    if (!isfinite(out->metric_plus) ||
+    if (!isfinite(out->metric_center) ||
+        !isfinite(out->metric_plus) ||
         !isfinite(out->metric_minus) ||
+        out->metric_center < 0.0f ||
         out->metric_plus < 0.0f ||
         out->metric_minus < 0.0f) {
         out->error_code = DPMZM_LOCK_ERR_BAD_METRIC;
         return false;
+    }
+
+    if (out->metric_center <= out->metric_plus &&
+        out->metric_center <= out->metric_minus) {
+        /*
+         * Near a sharp MITP/QTP valley, the two side probes can be asymmetric
+         * even when the current center is already the best point. Without this
+         * center check, a pure left/right difference would keep pushing the
+         * bias away from the valley.
+         */
+        out->center_is_best = true;
+        out->error = 0.0f;
+        out->direction = "hold-center";
+        out->valid = true;
+        return true;
+    }
+
+    {
+        const float best_side_metric = fminf(out->metric_plus, out->metric_minus);
+        const float improvement_rel =
+            (out->metric_center - best_side_metric) /
+            (out->metric_center + best_side_metric + 1e-12f);
+
+        if (improvement_rel < DPMZM_LOCK_MIN_SIDE_IMPROVEMENT_REL) {
+            out->error = 0.0f;
+            out->direction = "hold-weak";
+            out->valid = true;
+            return true;
+        }
     }
 
     denom = out->metric_plus + out->metric_minus + 1e-12f;
@@ -398,6 +441,11 @@ void dpmzm_lock_print_probe_result(const dpmzm_lock_probe_result_t *result)
            (double)result->center_v,
            (double)result->plus_v,
            (double)result->minus_v);
+    printf("  metric0: %.9f (%.2f dBm) dc=%+.6fV best=%s\r\n",
+           (double)result->metric_center,
+           (double)result->metric_center_dbm,
+           (double)result->dc_center_v,
+           result->center_is_best ? "yes" : "no");
     printf("  metric+: %.9f (%.2f dBm) dc=%+.6fV\r\n",
            (double)result->metric_plus,
            (double)result->metric_plus_dbm,

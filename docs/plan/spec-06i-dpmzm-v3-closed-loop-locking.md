@@ -658,7 +658,7 @@ C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_171230_dpm
 
 下一步建议优先验证：
 
-1. 进入闭环前，对最终 `I/Q` 再做一次 `+/-0.1 V, 0.01 V` 小窗口复查。
+1. 进入闭环前，对最终 `I/Q` 再做一次以当前偏压为中心的 `+/-0.08 V, 0.01 V, blocks=4` 小窗口复查。
 2. 闭环前 60 秒只修 `I/Q`，让 `I/Q` 先稳定，再启用完整 `P -> I -> P -> Q -> P`。
 3. 如果某一路连续多次同方向修正，则触发局部重扫，而不是让它慢慢爬。
 4. 将 `I/Q` 的闭环更新从左右差分升级为三点二次拟合谷底估计。
@@ -729,3 +729,116 @@ C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_173402_dpm
 C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-04-30_174224_dpmzm_positive_branch_flow_serial.log
 C:\Users\Administrator\Desktop\DPMZM_contral_bais\simulation_image\auto_flow\2026-04-30_174224_dpmzm_positive_branch_flow_all_stages.png
 ```
+
+### 15.8 已落实：闭环中心点保护，避免谷底被左右差分推走
+
+2026-05-06 针对闭环不稳定问题，检查 5 分钟闭环日志后发现一个关键风险：
+
+```text
+原闭环 probe 只测 V+delta 和 V-delta
+如果当前 Vcenter 已经在谷底，但左右两侧曲线不完全对称
+则 metric+ 和 metric- 仍会给出非零误差
+控制器会持续把偏压从真正谷底推走
+```
+
+这与此前 5 分钟数据中的 `I` 路单向慢漂现象一致：`I` 路每次都给出正误差，导致偏压持续往负方向移动；但后续小窗口复查显示中心点本身可能已经非常接近谷底。
+
+因此闭环 probe 已从“两点差分”升级为“三点保护”：
+
+```text
+测量 Vcenter
+测量 Vcenter + delta
+测量 Vcenter - delta
+
+如果 Vcenter 的指标已经低于左右两点：
+    强制 hold-center，不移动偏压
+否则：
+    继续使用左右两点差分判断移动方向
+```
+
+对应代码：
+
+```text
+control/src/ctrl_lock_dpmzm.c
+control/inc/ctrl_lock_dpmzm.h
+```
+
+串口输出新增 `metric0` 行，用来观察中心点是否确实为三点中最好：
+
+```text
+metric0: ... best=yes
+direction=hold-center
+```
+
+### 15.9 已落实：弱证据保持门限，避免闭环追踪噪声缓慢漂移
+
+2026-05-06 的 `COM8` 闭环验证显示，`hold-center` 能解决“中心点已经最好但左右不对称仍然推动偏压”的问题；但 120 s 记录中仍然能看到 `I/Q/P` 在部分时刻因为某一侧 probe 只略微优于中心点而继续小步移动。这个现象会把瞬时噪声、光路扰动或 ADC 测量抖动积分成慢漂移。
+
+因此在三点 probe 后新增一层 confidence gate：
+
+```text
+best_side = min(metric+, metric-)
+improvement_rel = (metric0 - best_side) / (metric0 + best_side)
+
+如果 improvement_rel < 20%：
+    direction = hold-weak
+    step = 0
+否则：
+    才允许进入左右差分移动判断
+```
+
+当前含义：
+
+- `hold-center`：中心点已经是三点里最优，强制保持。
+- `hold-weak`：中心点不是最优，但侧点优势不足 20%，认为证据太弱，避免追踪噪声。
+- `positive/negative`：只有侧点明显优于中心点时才允许移动。
+
+这个修改的目标不是让闭环完全不动，而是让它只在“确实偏离谷底”时再动。下一步需要用 2-5 min 锁定记录确认光谱载波的最好/最差差异是否从此前约 `5 dB` 收敛下来。
+
+### 15.10 已落实：P-QTP 正分支保持，避免自动流程先天找错点
+
+同日验证中还发现，如果 `P-QTP` 粗扫阶段正负两个 QTP 谷底深度非常接近，固件原本的“全局最深谷底”规则会被小于 `1 dB` 的测量差异影响，导致流程从期望的正 `P` 分支跳到负 `P` 分支。此时后续 `I-MITP / Q-MITP / P-QTP` 小窗口虽然都能局部收敛，但收敛的是另一组等效或不期望的工作点，不能用来评价闭环稳定性。
+
+因此自动流程对 `P-QTP` 候选点增加正分支保持：
+
+```text
+global_best = 所有 P-QTP 候选里的最深谷底
+positive_best = P >= 0 的候选里最深谷底
+
+如果 positive_best 不比 global_best 差超过 3 dB：
+    使用 positive_best
+否则：
+    使用 global_best
+```
+
+这条规则的含义是：不强行选择明显很差的正分支，但当正负分支几乎等价时，优先保持实验脚本定义的正分支路线，减少自动流程随机翻支。
+
+阶段判断：
+
+- 这个修改主要解决“谷底附近因为左右不对称导致闭环自行爬走”的问题。
+- 代价是每次 `lock probe/step` 从 2 个测量点增加到 3 个测量点，闭环速度会下降约 50%。
+- 当前阶段我们优先保证稳定性；如果后续确认稳定，再考虑只在误差超过死区时补测中心点，以恢复部分速度。
+
+### 15.11 试验中：锚点守护 + 触发式小窗复查
+
+2026-05-06 的 3 分钟稳定性记录显示，三点保护和弱证据保持后，`P` 路已经基本能守住，但 `I/Q` 仍然存在约 `50-60 mV` 量级的慢漂移。这个现象说明后台连续对 `I/Q` 做小步闭环时，仍可能把测量噪声、光路慢扰动或局部曲线不对称积分成偏压漂移。
+
+因此当前试验版本把连续闭环序列从：
+
+```text
+P -> I -> P -> Q -> P
+```
+
+临时改为：
+
+```text
+P only
+```
+
+含义是：
+- `I/Q` 由自动扫描末尾的小窗口复查确定后，作为锚点保持不动。
+- 连续后台闭环只守 `P-QTP`，避免 `I/Q` 被长期小步积分推离 `MITP`。
+- 如果后续状态监测发现 `I/Q` 指标明显劣化，再由脚本或后续固件状态机触发一次 `I/Q` 小窗口复查。
+- 2026-05-06 优化触发逻辑：`I/Q` 不再因为单次功率变浅就立刻复查；优先看 `lock probe` 的方向证据。只有连续两次 `direction=positive/negative`，或连续两次超过严重劣化阈值，才触发 `I/Q` 小窗复查。方向仍为 `hold-center / hold-weak / hold` 时，baseline 采用滑动更新，避免单次特别深的谷底值导致后续正常波动被误判。
+
+这一步不是最终控制架构，而是用来验证一个关键假设：当前光谱载波慢波动是否主要来自 `I/Q` 连续闭环慢漂，而不是 `P` 路本身失锁。

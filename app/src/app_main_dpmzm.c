@@ -35,8 +35,8 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_CAPTURE_SETTLE_DEFAULT_MS 20U
 #define DPMZM_CAPTURE_DRDY_TIMEOUT_MS   5U
 #define DPMZM_LOCK_DEFAULT_DELTA_V      0.05f
-#define DPMZM_LOCK_DEFAULT_GAIN_V       0.01f
-#define DPMZM_LOCK_DEFAULT_MAX_STEP_V   0.01f
+#define DPMZM_LOCK_DEFAULT_GAIN_V       0.003f
+#define DPMZM_LOCK_DEFAULT_MAX_STEP_V   0.003f
 #define DPMZM_LOCK_DEFAULT_DEADBAND     0.03f
 #define DPMZM_LOCK_DEFAULT_SETTLE_MS    10U
 #define DPMZM_LOCK_DEFAULT_BLOCKS       10U
@@ -1275,7 +1275,7 @@ static void handle_lock_start(void)
 
     dpmzm_lock_start();
     s_lock_last_cycle_ms = 0U;
-    printf("[dpmzm][lock] start: sequence P -> I -> P -> Q -> P\r\n");
+    printf("[dpmzm][lock] start: sequence P only (I/Q anchor guard)\r\n");
 }
 
 static void handle_lock_stop(void)
