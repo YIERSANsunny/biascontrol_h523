@@ -37,6 +37,8 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
     if (hspi == &hspi1) {
         app_dpmzm_pilot_spi_error();
+    } else if (hspi == &hspi2) {
+        HAL_SPI_ErrorCallback_ADC(hspi);
     }
 }
 

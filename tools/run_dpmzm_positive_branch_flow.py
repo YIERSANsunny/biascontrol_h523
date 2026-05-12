@@ -22,6 +22,11 @@ except ImportError as exc:
 RAW_DATA_DIR = Path(r"C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data")
 SIM_IMAGE_DIR = Path(r"C:\Users\Administrator\Desktop\DPMZM_contral_bais\simulation_image\auto_flow")
 METRIC_PREFIX = "DPMZMCSV,"
+MATP_PLATFORM_THRESHOLD = 0.65
+MATP_PLATFORM_MIN_POINTS = 3
+MATP_PLATFORM_MIN_WIDTH_V = 1.0
+MATP_PLATFORM_WIDTH_REF_V = 2.0
+MATP_PLATFORM_WIDTH_WEIGHT = 0.2
 
 METRIC_HEADER = [
     "stage",
@@ -83,6 +88,21 @@ class ProbeMetric:
     dbm: float
     center_best: bool = False
     direction: str = ""
+
+
+@dataclass
+class MatpPlatform:
+    left_v: float
+    right_v: float
+    center_v: float
+    width_v: float
+    point_count: int
+    mean_pnorm: float
+    width_norm: float
+    ripple: float
+    score: float
+    touches_edge: bool = False
+    fallback: bool = False
 
 
 @dataclass
@@ -239,7 +259,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p-turn-max-shifts", type=int, default=8)
     parser.add_argument("--iq-turn-step", type=float, default=0.10)
     parser.add_argument("--iq-turn-window", type=float, default=0.10)
-    parser.add_argument("--iq-turn-max-shifts", type=int, default=4)
+    parser.add_argument(
+        "--iq-turn-max-shifts",
+        type=int,
+        default=-1,
+        help="Maximum I/Q turning-search shifts; negative means search until bracketed or blocked.",
+    )
     parser.add_argument(
         "--disable-p-turn-search",
         action="store_true",
@@ -253,6 +278,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-i", type=float, default=0.0)
     parser.add_argument("--initial-q", type=float, default=0.0)
     parser.add_argument("--initial-p", type=float, default=0.0)
+    parser.add_argument(
+        "--manual-p-qtp-seed",
+        action="store_true",
+        help=(
+            "Skip auto coarse/fine. Use initial I/Q, run one P-QTP sweep to "
+            "seed P, then continue with the normal turning-point flow."
+        ),
+    )
+    parser.add_argument(
+        "--iq-matp-seed",
+        action="store_true",
+        help=(
+            "Before manual P-QTP seeding, run I/Q MATP coarse scans and use "
+            "high first-order-power plateau centers as the initial I/Q biases."
+        ),
+    )
+    parser.add_argument("--manual-matp-start", type=float, default=-9.0)
+    parser.add_argument("--manual-matp-stop", type=float, default=9.0)
+    parser.add_argument("--manual-matp-step", type=float, default=0.5)
+    parser.add_argument("--manual-p-start", type=float, default=-9.0)
+    parser.add_argument("--manual-p-stop", type=float, default=9.0)
+    parser.add_argument("--manual-p-step", type=float, default=0.5)
+    parser.add_argument("--manual-mitp-start", type=float, default=-9.0)
+    parser.add_argument("--manual-mitp-stop", type=float, default=9.0)
+    parser.add_argument("--manual-mitp-step", type=float, default=0.5)
     parser.add_argument(
         "--skip-initial-bias",
         action="store_true",
@@ -328,6 +378,130 @@ def metric_value(row: MetricRow) -> float:
     if row.target == "q":
         return row.mag_fq
     return row.mag_fi
+
+
+def choose_mitp_valley_by_dc(rows: list[MetricRow], label: str, session: SerialSession) -> float:
+    if not rows:
+        raise RuntimeError(f"{label}: no metric rows captured")
+
+    valleys: list[MetricRow] = []
+    for index in range(1, len(rows) - 1):
+        left = metric_value(rows[index - 1])
+        center = metric_value(rows[index])
+        right = metric_value(rows[index + 1])
+        if center <= left and center <= right:
+            valleys.append(rows[index])
+
+    if not valleys:
+        fallback = min(rows, key=metric_value)
+        session.progress(
+            f"{label}: no local valley; fallback to global metric minimum "
+            f"{fallback.sweep:+.3f}V metric={metric_value(fallback):.9f} dc={fallback.dc:.6f}"
+        )
+        return fallback.sweep
+
+    selected = min(valleys, key=lambda row: row.dc)
+    summary = ", ".join(
+        f"{row.sweep:+.3f}V(m={metric_value(row):.9f},dc={row.dc:.6f})"
+        for row in valleys[:6]
+    )
+    if len(valleys) > 6:
+        summary += ", ..."
+    session.progress(
+        f"{label}: local valleys={len(valleys)} [{summary}] -> "
+        f"select {selected.sweep:+.3f}V by lowest DC"
+    )
+    return selected.sweep
+
+
+def choose_matp_plateau_center(rows: list[MetricRow], label: str, session: SerialSession) -> float:
+    if not rows:
+        raise RuntimeError(f"{label}: no metric rows captured")
+
+    rows = sorted(rows, key=lambda row: row.sweep)
+    powers = [metric_value(row) ** 2 for row in rows]
+    p_min = min(powers)
+    p_max = max(powers)
+    span = p_max - p_min
+    if span <= max(p_max, 1.0) * 1e-12:
+        fallback = max(rows, key=metric_value)
+        session.progress(
+            f"{label}: flat MATP power; fallback to global first-order maximum "
+            f"{fallback.sweep:+.3f}V metric={metric_value(fallback):.9f}"
+        )
+        return fallback.sweep
+
+    pnorm = [(power - p_min) / span for power in powers]
+    flags = [value >= MATP_PLATFORM_THRESHOLD for value in pnorm]
+
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, flag in enumerate(flags):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            runs.append((start, index - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(flags) - 1))
+
+    platforms: list[MatpPlatform] = []
+    for left_index, right_index in runs:
+        point_count = right_index - left_index + 1
+        left_v = rows[left_index].sweep
+        right_v = rows[right_index].sweep
+        width_v = abs(right_v - left_v)
+        if point_count < MATP_PLATFORM_MIN_POINTS or width_v < MATP_PLATFORM_MIN_WIDTH_V:
+            continue
+
+        values = pnorm[left_index:right_index + 1]
+        weights = [max(value, 1e-9) for value in values]
+        x_values = [row.sweep for row in rows[left_index:right_index + 1]]
+        center_v = sum(x * weight for x, weight in zip(x_values, weights)) / sum(weights)
+        mean_pnorm = sum(values) / len(values)
+        width_norm = min(width_v / MATP_PLATFORM_WIDTH_REF_V, 1.0)
+        ripple = (sum((value - mean_pnorm) ** 2 for value in values) / len(values)) ** 0.5
+        score = mean_pnorm + MATP_PLATFORM_WIDTH_WEIGHT * width_norm
+        platforms.append(
+            MatpPlatform(
+                left_v=left_v,
+                right_v=right_v,
+                center_v=center_v,
+                width_v=width_v,
+                point_count=point_count,
+                mean_pnorm=mean_pnorm,
+                width_norm=width_norm,
+                ripple=ripple,
+                score=score,
+                touches_edge=left_index == 0 or right_index == len(rows) - 1,
+            )
+        )
+
+    if not platforms:
+        best_index = max(range(len(rows)), key=lambda item: pnorm[item])
+        fallback = rows[best_index]
+        session.progress(
+            f"{label}: no high-power platform "
+            f"(threshold={MATP_PLATFORM_THRESHOLD:.2f}, min_width={MATP_PLATFORM_MIN_WIDTH_V:.2f}V); "
+            f"fallback to global first-order maximum {fallback.sweep:+.3f}V "
+            f"metric={metric_value(fallback):.9f} pnorm={pnorm[best_index]:.3f}"
+        )
+        return fallback.sweep
+
+    platforms.sort(key=lambda item: item.score, reverse=True)
+    selected = platforms[0]
+    summary = "; ".join(
+        f"{index + 1}:{item.left_v:+.3f}..{item.right_v:+.3f}V "
+        f"center={item.center_v:+.3f}V score={item.score:.3f} "
+        f"mean={item.mean_pnorm:.3f} width={item.width_v:.3f}V"
+        for index, item in enumerate(platforms[:4])
+    )
+    session.progress(
+        f"{label}: high-power platforms={len(platforms)} "
+        f"(threshold={MATP_PLATFORM_THRESHOLD:.2f}) [{summary}] -> "
+        f"select center {selected.center_v:+.3f}V"
+    )
+    return selected.center_v
 
 
 def parse_auto_fine_picks(lines: list[str]) -> AutoFinePicks:
@@ -684,12 +858,23 @@ def turning_point_scan_and_apply(
     center = clamp(center_v)
     bracketed_center: float | None = None
 
-    for attempt in range(max_shifts + 1):
+    attempt = 0
+    visited_centers: set[float] = set()
+    while max_shifts < 0 or attempt <= max_shifts:
         probe_center = center
         if center - turn_step_v < -9.0:
             probe_center = clamp(-9.0 + turn_step_v)
         elif center + turn_step_v > 9.0:
             probe_center = clamp(9.0 - turn_step_v)
+
+        center_key = round(probe_center, 6)
+        if center_key in visited_centers:
+            session.progress(
+                f"{label_prefix} repeated center {probe_center:+.3f}V; "
+                "stop unbounded search to avoid oscillation"
+            )
+            break
+        visited_centers.add(center_key)
 
         start_v = clamp(probe_center - turn_step_v)
         stop_v = clamp(probe_center + turn_step_v)
@@ -719,6 +904,7 @@ def turning_point_scan_and_apply(
         if abs(next_center - center) < 1e-6:
             break
         center = next_center
+        attempt += 1
 
     if bracketed_center is None:
         session.progress(f"{label_prefix} fallback: fixed small-window scan")
@@ -818,56 +1004,170 @@ def main() -> int:
             session.send("dpmzm status")
             session.read_for(1.0)
 
-        before_coarse_line_count = len(session.lines)
-        session.send("dpmzm auto coarse")
-        coarse_line = session.wait_for_any(
-            ["[dpmzm][auto] applied coarse result", "[dpmzm][auto] coarse failed", "[dpmzm][auto] failed"],
-            args.coarse_timeout,
-            "auto coarse",
-        )
-        if coarse_line is None or "failed" in coarse_line:
-            return 2
-
         p_small_window = args.small_window if args.small_window is not None else args.p_small_window
         iq_small_window = args.small_window if args.small_window is not None else args.iq_small_window
 
-        if args.skip_auto_fine:
-            branch = parse_applied_auto_result(session.lines[before_coarse_line_count:], "coarse")
-            if branch is None:
-                session.progress("failed to parse I/Q/P seed from auto coarse")
-                return 4
+        if args.manual_p_qtp_seed:
+            i_seed = args.initial_i
+            q_seed = args.initial_q
+            if args.iq_matp_seed:
+                session.progress(
+                    "I/Q MATP seed: "
+                    f"sweep={args.manual_matp_start:+.3f}..{args.manual_matp_stop:+.3f}V "
+                    f"step={args.manual_matp_step:.3f}V blocks={args.iq_blocks}"
+                )
+                _, i_matp_rows = scan_collect(
+                    session,
+                    "matp",
+                    "i",
+                    clamp(args.manual_matp_start),
+                    clamp(args.manual_matp_stop),
+                    args.manual_matp_step,
+                    args.iq_blocks,
+                    "manual seed I-MATP",
+                    timeout_s=args.coarse_timeout,
+                )
+                i_seed = choose_matp_plateau_center(i_matp_rows, "manual seed I-MATP", session)
+                session.send(f"dpmzm set bias i {i_seed:.3f}")
+                session.read_for(1.0)
+
+                _, q_matp_rows = scan_collect(
+                    session,
+                    "matp",
+                    "q",
+                    clamp(args.manual_matp_start),
+                    clamp(args.manual_matp_stop),
+                    args.manual_matp_step,
+                    args.iq_blocks,
+                    "manual seed Q-MATP",
+                    timeout_s=args.coarse_timeout,
+                )
+                q_seed = choose_matp_plateau_center(q_matp_rows, "manual seed Q-MATP", session)
+                session.send(f"dpmzm set bias q {q_seed:.3f}")
+                session.read_for(1.0)
+
             session.progress(
-                f"turn-search seed from auto coarse: I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
+                "manual P-QTP seed: "
+                f"I={i_seed:+.3f}V Q={q_seed:+.3f}V "
+                f"P sweep={args.manual_p_start:+.3f}..{args.manual_p_stop:+.3f}V "
+                f"step={args.manual_p_step:.3f}V blocks={args.p_blocks}"
+            )
+            p_seed, _ = scan_collect(
+                session,
+                "qtp",
+                "p",
+                clamp(args.manual_p_start),
+                clamp(args.manual_p_stop),
+                args.manual_p_step,
+                args.p_blocks,
+                "manual seed P-QTP",
+                timeout_s=args.coarse_timeout,
+            )
+            session.send(f"dpmzm set bias p {p_seed:.3f}")
+            session.read_for(1.0)
+
+            _, i_mitp_rows = scan_collect(
+                session,
+                "mitp",
+                "i",
+                clamp(args.manual_mitp_start),
+                clamp(args.manual_mitp_stop),
+                args.manual_mitp_step,
+                args.iq_blocks,
+                "manual seed I-MITP",
+                timeout_s=args.coarse_timeout,
+            )
+            i_seed = choose_mitp_valley_by_dc(i_mitp_rows, "manual seed I-MITP", session)
+            session.send(f"dpmzm set bias i {i_seed:.3f}")
+            session.read_for(1.0)
+
+            _, q_mitp_rows = scan_collect(
+                session,
+                "mitp",
+                "q",
+                clamp(args.manual_mitp_start),
+                clamp(args.manual_mitp_stop),
+                args.manual_mitp_step,
+                args.iq_blocks,
+                "manual seed Q-MITP",
+                timeout_s=args.coarse_timeout,
+            )
+            q_seed = choose_mitp_valley_by_dc(q_mitp_rows, "manual seed Q-MITP", session)
+            session.send(f"dpmzm set bias q {q_seed:.3f}")
+            session.read_for(1.0)
+
+            session.progress(
+                "manual P-QTP rescan after I/Q MITP: "
+                f"I={i_seed:+.3f}V Q={q_seed:+.3f}V "
+                f"P sweep={args.manual_p_start:+.3f}..{args.manual_p_stop:+.3f}V "
+                f"step={args.manual_p_step:.3f}V blocks={args.p_blocks}"
+            )
+            p_rescan_seed, _ = scan_collect(
+                session,
+                "qtp",
+                "p",
+                clamp(args.manual_p_start),
+                clamp(args.manual_p_stop),
+                args.manual_p_step,
+                args.p_blocks,
+                "manual seed P-QTP after MITP",
+                timeout_s=args.coarse_timeout,
+            )
+            branch = BiasPoint(i=i_seed, q=q_seed, p=p_rescan_seed)
+            session.progress(
+                f"manual turn-search seed after MITP: "
+                f"I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
             )
         else:
-            before_fine_line_count = len(session.lines)
-            session.send("dpmzm auto fine")
-            fine_line = session.wait_for_any(
-                ["[dpmzm][auto] applied fine result", "[dpmzm][auto] fine failed"],
-                args.fine_timeout,
-                "auto fine",
+            before_coarse_line_count = len(session.lines)
+            session.send("dpmzm auto coarse")
+            coarse_line = session.wait_for_any(
+                ["[dpmzm][auto] applied coarse result", "[dpmzm][auto] coarse failed", "[dpmzm][auto] failed"],
+                args.coarse_timeout,
+                "auto coarse",
             )
-            if fine_line is None or "failed" in fine_line:
-                return 3
+            if coarse_line is None or "failed" in coarse_line:
+                return 2
 
-            picks = parse_auto_fine_picks(session.lines[before_fine_line_count:])
-            if not picks.complete():
-                session.progress("failed to parse positive-branch P/I/Q picks from auto fine")
-                return 4
-
-            branch = picks.positive_branch()
-            session.progress(
-                f"positive branch from auto fine: I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
-            )
-            if picks.applied_final is not None:
+            if args.skip_auto_fine:
+                branch = parse_applied_auto_result(session.lines[before_coarse_line_count:], "coarse")
+                if branch is None:
+                    session.progress("failed to parse I/Q/P seed from auto coarse")
+                    return 4
                 session.progress(
-                    f"auto fine final ignored: I={picks.applied_final.i:+.3f}V "
-                    f"Q={picks.applied_final.q:+.3f}V P={picks.applied_final.p:+.3f}V"
+                    f"turn-search seed from auto coarse: I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
                 )
+            else:
+                before_fine_line_count = len(session.lines)
+                session.send("dpmzm auto fine")
+                fine_line = session.wait_for_any(
+                    ["[dpmzm][auto] applied fine result", "[dpmzm][auto] fine failed"],
+                    args.fine_timeout,
+                    "auto fine",
+                )
+                if fine_line is None or "failed" in fine_line:
+                    return 3
+
+                picks = parse_auto_fine_picks(session.lines[before_fine_line_count:])
+                if not picks.complete():
+                    session.progress("failed to parse positive-branch P/I/Q picks from auto fine")
+                    return 4
+
+                branch = picks.positive_branch()
+                session.progress(
+                    f"positive branch from auto fine: I={branch.i:+.3f}V Q={branch.q:+.3f}V P={branch.p:+.3f}V"
+                )
+                if picks.applied_final is not None:
+                    session.progress(
+                        f"auto fine final ignored: I={picks.applied_final.i:+.3f}V "
+                        f"Q={picks.applied_final.q:+.3f}V P={picks.applied_final.p:+.3f}V"
+                    )
 
         for axis, value in (("i", branch.i), ("q", branch.q), ("p", branch.p)):
             session.send(f"dpmzm set bias {axis} {value:.3f}")
             session.read_for(1.0)
+        session.send("dpmzm status")
+        session.read_for(1.0)
 
         if args.disable_p_turn_search:
             branch.p = scan_and_apply(session, "qtp", "p", branch.p, p_small_window, args.small_step, args.p_blocks)
@@ -934,27 +1234,34 @@ def main() -> int:
 
         if not args.disable_prelock_iq_recheck:
             session.progress(
-                "pre-lock I/Q recheck: "
-                f"+/-{args.prelock_iq_recheck_window:.3f}V "
+                "pre-lock I/Q turning recheck: "
+                f"turn-step={args.iq_turn_step:.3f}V "
+                f"confirm +/-{args.prelock_iq_recheck_window:.3f}V "
                 f"step={args.prelock_iq_recheck_step:.3f}V"
             )
-            branch.i = scan_and_apply_collect(
+            branch.i = turning_point_scan_and_apply(
                 session,
                 "mitp",
                 "i",
                 branch.i,
                 args.prelock_iq_recheck_window,
+                args.prelock_iq_recheck_window,
                 args.prelock_iq_recheck_step,
+                args.iq_turn_step,
+                args.iq_turn_max_shifts,
                 args.iq_blocks,
                 "pre-lock I recheck",
             )
-            branch.q = scan_and_apply_collect(
+            branch.q = turning_point_scan_and_apply(
                 session,
                 "mitp",
                 "q",
                 branch.q,
                 args.prelock_iq_recheck_window,
+                args.prelock_iq_recheck_window,
                 args.prelock_iq_recheck_step,
+                args.iq_turn_step,
+                args.iq_turn_max_shifts,
                 args.iq_blocks,
                 "pre-lock Q recheck",
             )

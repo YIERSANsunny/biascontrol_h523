@@ -34,12 +34,15 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_CAPTURE_SAMPLES_MAX       8192U
 #define DPMZM_CAPTURE_SETTLE_DEFAULT_MS 20U
 #define DPMZM_CAPTURE_DRDY_TIMEOUT_MS   5U
-#define DPMZM_LOCK_DEFAULT_DELTA_V      0.05f
+#define DPMZM_LOCK_DEFAULT_DELTA_V      0.01f
 #define DPMZM_LOCK_DEFAULT_GAIN_V       0.003f
 #define DPMZM_LOCK_DEFAULT_MAX_STEP_V   0.003f
 #define DPMZM_LOCK_DEFAULT_DEADBAND     0.03f
 #define DPMZM_LOCK_DEFAULT_SETTLE_MS    10U
-#define DPMZM_LOCK_DEFAULT_BLOCKS       10U
+#define DPMZM_LOCK_DEFAULT_IQ_BLOCKS    4U
+#define DPMZM_LOCK_DEFAULT_P_BLOCKS     10U
+#define DPMZM_LOCK_DEFAULT_IQ_WINDOW_V  0.20f
+#define DPMZM_LOCK_DEFAULT_P_WINDOW_V   0.30f
 #define DPMZM_LOCK_DEFAULT_INTERVAL_MS  500U
 
 /*
@@ -995,7 +998,7 @@ static void fill_lock_request(dpmzm_lock_request_t *req)
 
     memset(req, 0, sizeof(*req));
     fill_auto_scan_template(&req->scan_template);
-    req->scan_template.blocks = DPMZM_LOCK_DEFAULT_BLOCKS;
+    req->scan_template.blocks = DPMZM_LOCK_DEFAULT_IQ_BLOCKS;
     req->scan_template.settle_ms = DPMZM_LOCK_DEFAULT_SETTLE_MS;
     req->scan_template.dump_mode = DPMZM_SCAN_DUMP_METRICS;
     req->delta_v = DPMZM_LOCK_DEFAULT_DELTA_V;
@@ -1004,6 +1007,10 @@ static void fill_lock_request(dpmzm_lock_request_t *req)
     req->deadband_rel = DPMZM_LOCK_DEFAULT_DEADBAND;
     req->min_bias_v = -10.0f;
     req->max_bias_v = 10.0f;
+    req->iq_anchor_window_v = DPMZM_LOCK_DEFAULT_IQ_WINDOW_V;
+    req->p_anchor_window_v = DPMZM_LOCK_DEFAULT_P_WINDOW_V;
+    req->iq_blocks = DPMZM_LOCK_DEFAULT_IQ_BLOCKS;
+    req->p_blocks = DPMZM_LOCK_DEFAULT_P_BLOCKS;
     req->loop_interval_ms = DPMZM_LOCK_DEFAULT_INTERVAL_MS;
 }
 
@@ -1197,9 +1204,8 @@ static void handle_auto_fine(void)
     req.iq_blocks = 4U;
     req.p_blocks = 10U;
 
-    printf("[dpmzm][auto] fine start: wide-only +/-%0.2fV step=%.3f blocks IQ=%lu P=%lu\r\n",
-           (double)req.wide_range_v,
-           (double)req.wide_step_v,
+    printf("[dpmzm][auto] fine start: P/I/Q/P turn search + prelock I/Q recheck step=%.3f blocks IQ=%lu P=%lu\r\n",
+           (double)req.fine_step_v,
            (unsigned long)req.iq_blocks,
            (unsigned long)req.p_blocks);
 
@@ -1273,9 +1279,14 @@ static void handle_lock_start(void)
         }
     }
 
-    dpmzm_lock_start();
+    dpmzm_lock_start_with_anchor(s_dpmzm_ctx.bias_i_v,
+                                 s_dpmzm_ctx.bias_q_v,
+                                 s_dpmzm_ctx.bias_p_v);
     s_lock_last_cycle_ms = 0U;
-    printf("[dpmzm][lock] start: sequence P only (I/Q anchor guard)\r\n");
+    printf("[dpmzm][lock] start: sequence P-I-Q gradient, anchor I=%+.3fV Q=%+.3fV P=%+.3fV\r\n",
+           (double)s_dpmzm_ctx.bias_i_v,
+           (double)s_dpmzm_ctx.bias_q_v,
+           (double)s_dpmzm_ctx.bias_p_v);
 }
 
 static void handle_lock_stop(void)
@@ -1294,7 +1305,12 @@ static void handle_lock_status(void)
     printf("  gain:       %.3fV\r\n", (double)req.gain_v);
     printf("  max step:   %.3fV\r\n", (double)req.max_step_v);
     printf("  deadband:   %.3f\r\n", (double)req.deadband_rel);
-    printf("  blocks:     %lu\r\n", (unsigned long)req.scan_template.blocks);
+    printf("  blocks:     IQ=%lu P=%lu\r\n",
+           (unsigned long)req.iq_blocks,
+           (unsigned long)req.p_blocks);
+    printf("  window:     IQ=+/-%.3fV P=+/-%.3fV\r\n",
+           (double)req.iq_anchor_window_v,
+           (double)req.p_anchor_window_v);
     printf("  settle:     %lu ms\r\n", (unsigned long)req.scan_template.settle_ms);
     printf("  interval:   %lu ms\r\n", (unsigned long)req.loop_interval_ms);
 }

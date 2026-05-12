@@ -29,6 +29,8 @@ static uint8_t adc_tx_buf[12];
 static uint8_t adc_rx_buf[12];
 static volatile bool spi2_xfer_done = true;
 
+#define ADS131M02_SPI_TIMEOUT_MS 10U
+
 /* Last parsed sample (filled by DMA callback) */
 static volatile ads131m02_sample_t last_sample;
 
@@ -113,6 +115,16 @@ void HAL_SPI_TxRxCpltCallback_ADC(SPI_HandleTypeDef *hspi)
     }
 }
 
+void HAL_SPI_ErrorCallback_ADC(SPI_HandleTypeDef *hspi)
+{
+    if (hspi != &hspi2) {
+        return;
+    }
+
+    board_adc_cs_high();
+    spi2_xfer_done = true;
+}
+
 /* ========================================================================= */
 /*  Low-level SPI (blocking, for init/config)                                */
 /* ========================================================================= */
@@ -122,16 +134,26 @@ int ads131m02_spi_transfer(const uint32_t tx[4], uint32_t rx[4])
     uint8_t tx_buf[12];
     uint8_t rx_buf[12];
 
+    if (tx == NULL || rx == NULL) {
+        return -1;
+    }
+
+    if (hspi2.State != HAL_SPI_STATE_READY) {
+        board_adc_cs_high();
+        (void)HAL_SPI_Abort(&hspi2);
+    }
+
     pack_frame(tx, tx_buf);
 
     board_adc_cs_low();
 
     HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(
-        &hspi2, tx_buf, rx_buf, 12, HAL_MAX_DELAY);
+        &hspi2, tx_buf, rx_buf, 12, ADS131M02_SPI_TIMEOUT_MS);
 
     board_adc_cs_high();
 
     if (status != HAL_OK) {
+        (void)HAL_SPI_Abort(&hspi2);
         return -1;
     }
 
@@ -145,6 +167,14 @@ int ads131m02_spi_transfer(const uint32_t tx[4], uint32_t rx[4])
  */
 static int ads131m02_spi_transfer_dma(const uint32_t tx[4])
 {
+    if (tx == NULL) {
+        return -1;
+    }
+
+    if (!spi2_xfer_done || hspi2.State != HAL_SPI_STATE_READY) {
+        return -1;
+    }
+
     pack_frame(tx, adc_tx_buf);
 
     spi2_xfer_done = false;
@@ -326,6 +356,10 @@ int ads131m02_read_sample(ads131m02_sample_t *sample)
 {
     uint32_t tx[4] = {0, 0, 0, 0}; /* NULL command */
     uint32_t rx[4];
+
+    if (sample == NULL) {
+        return -1;
+    }
 
     int ret = ads131m02_spi_transfer(tx, rx);
     if (ret != 0) {

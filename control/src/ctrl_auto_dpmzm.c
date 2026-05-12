@@ -19,6 +19,16 @@
 #define DPMZM_AUTO_QTP_POSITIVE_MARGIN_DB     3.0f
 #define DPMZM_AUTO_MITP_DC_SELECT_WINDOW_DB   3.0f
 #define DPMZM_AUTO_DBM_FLOOR_MW               1e-15f
+#define DPMZM_AUTO_MATP_PLATFORM_THRESHOLD    0.65f
+#define DPMZM_AUTO_MATP_PLATFORM_MIN_POINTS   3U
+#define DPMZM_AUTO_MATP_PLATFORM_MIN_WIDTH_V  1.0f
+#define DPMZM_AUTO_MATP_PLATFORM_WIDTH_REF_V  2.0f
+#define DPMZM_AUTO_MATP_PLATFORM_WIDTH_WEIGHT 0.2f
+#define DPMZM_AUTO_TURN_STEP_V                0.10f
+#define DPMZM_AUTO_TURN_FINAL_WINDOW_V        0.10f
+#define DPMZM_AUTO_PRELOCK_IQ_WINDOW_V        0.08f
+#define DPMZM_AUTO_P_TURN_MAX_SHIFTS          8
+#define DPMZM_AUTO_IQ_TURN_MAX_SHIFTS         (-1)
 
 static dpmzm_auto_context_t s_auto_ctx;
 static dpmzm_scan_point_t s_scan_points[DPMZM_AUTO_SCAN_POINTS_MAX];
@@ -857,7 +867,7 @@ static bool build_plateau_region_between_anchors(const dpmzm_scan_point_t *point
     return true;
 }
 
-static bool pick_sensitive_regions(const dpmzm_scan_point_t *points,
+static bool __attribute__((unused)) pick_sensitive_regions(const dpmzm_scan_point_t *points,
                                    uint32_t point_count,
                                    dpmzm_matp_candidate_t *matp_candidates,
                                    uint32_t matp_count,
@@ -929,6 +939,158 @@ static bool pick_sensitive_regions(const dpmzm_scan_point_t *points,
 
     *main_region = best;
     *backup_region = second;
+    return true;
+}
+
+static bool pick_matp_high_power_platform(const dpmzm_scan_point_t *points,
+                                          uint32_t point_count,
+                                          dpmzm_scan_target_t target,
+                                          float *center_v_out)
+{
+    uint32_t i;
+    float p_min = FLT_MAX;
+    float p_max = -FLT_MAX;
+    float span;
+    float best_score = -FLT_MAX;
+    float best_center = 0.0f;
+    float best_left = 0.0f;
+    float best_right = 0.0f;
+    float best_mean = 0.0f;
+    float best_width = 0.0f;
+    uint32_t best_count = 0U;
+    bool best_valid = false;
+
+    if (points == NULL || point_count == 0U || center_v_out == NULL) {
+        return false;
+    }
+
+    for (i = 0U; i < point_count; i++) {
+        float metric = metric_from_point(DPMZM_SCAN_STAGE_MATP, target, &points[i]);
+        float power = metric * metric;
+
+        if (power < p_min) {
+            p_min = power;
+        }
+        if (power > p_max) {
+            p_max = power;
+        }
+    }
+
+    span = p_max - p_min;
+    if (span <= fmaxf(p_max, 1.0f) * 1e-12f) {
+        float best_metric = -FLT_MAX;
+        uint32_t best_index = 0U;
+
+        for (i = 0U; i < point_count; i++) {
+            float metric = metric_from_point(DPMZM_SCAN_STAGE_MATP, target, &points[i]);
+            if (metric > best_metric) {
+                best_metric = metric;
+                best_index = i;
+            }
+        }
+        *center_v_out = points[best_index].sweep_v;
+        printf("[dpmzm][auto] %s MATP platform fallback: flat power, use max %+.3fV\r\n",
+               dpmzm_scan_target_name(target),
+               (double)*center_v_out);
+        return true;
+    }
+
+    i = 0U;
+    while (i < point_count) {
+        uint32_t left = i;
+        uint32_t right;
+        uint32_t count;
+        float width_v;
+        float weighted_sum = 0.0f;
+        float weight_sum = 0.0f;
+        float mean_norm = 0.0f;
+        float width_norm;
+        float score;
+        uint32_t j;
+
+        float metric = metric_from_point(DPMZM_SCAN_STAGE_MATP, target, &points[i]);
+        float power = metric * metric;
+        float pnorm = (power - p_min) / span;
+        if (pnorm < DPMZM_AUTO_MATP_PLATFORM_THRESHOLD) {
+            i++;
+            continue;
+        }
+
+        right = i;
+        while (right + 1U < point_count) {
+            float next_metric = metric_from_point(DPMZM_SCAN_STAGE_MATP,
+                                                  target,
+                                                  &points[right + 1U]);
+            float next_power = next_metric * next_metric;
+            float next_norm = (next_power - p_min) / span;
+            if (next_norm < DPMZM_AUTO_MATP_PLATFORM_THRESHOLD) {
+                break;
+            }
+            right++;
+        }
+
+        count = right - left + 1U;
+        width_v = fabsf(points[right].sweep_v - points[left].sweep_v);
+        if (count >= DPMZM_AUTO_MATP_PLATFORM_MIN_POINTS &&
+            width_v >= DPMZM_AUTO_MATP_PLATFORM_MIN_WIDTH_V) {
+            for (j = left; j <= right; j++) {
+                float row_metric = metric_from_point(DPMZM_SCAN_STAGE_MATP,
+                                                     target,
+                                                     &points[j]);
+                float row_power = row_metric * row_metric;
+                float row_norm = (row_power - p_min) / span;
+                float weight = fmaxf(row_norm, 1e-9f);
+                weighted_sum += points[j].sweep_v * weight;
+                weight_sum += weight;
+                mean_norm += row_norm;
+            }
+
+            mean_norm /= (float)count;
+            width_norm = fminf(width_v / DPMZM_AUTO_MATP_PLATFORM_WIDTH_REF_V, 1.0f);
+            score = mean_norm + (DPMZM_AUTO_MATP_PLATFORM_WIDTH_WEIGHT * width_norm);
+            if (score > best_score) {
+                best_score = score;
+                best_center = weighted_sum / weight_sum;
+                best_left = points[left].sweep_v;
+                best_right = points[right].sweep_v;
+                best_mean = mean_norm;
+                best_width = width_v;
+                best_count = count;
+                best_valid = true;
+            }
+        }
+
+        i = right + 1U;
+    }
+
+    if (!best_valid) {
+        float best_metric = -FLT_MAX;
+        uint32_t best_index = 0U;
+
+        for (i = 0U; i < point_count; i++) {
+            float metric = metric_from_point(DPMZM_SCAN_STAGE_MATP, target, &points[i]);
+            if (metric > best_metric) {
+                best_metric = metric;
+                best_index = i;
+            }
+        }
+        *center_v_out = points[best_index].sweep_v;
+        printf("[dpmzm][auto] %s MATP platform fallback: no wide high-power platform, use max %+.3fV\r\n",
+               dpmzm_scan_target_name(target),
+               (double)*center_v_out);
+        return true;
+    }
+
+    *center_v_out = best_center;
+    printf("[dpmzm][auto] %s MATP platform: %+.3f..%+.3fV center=%+.3fV score=%.3f mean=%.3f width=%.3fV points=%lu\r\n",
+           dpmzm_scan_target_name(target),
+           (double)best_left,
+           (double)best_right,
+           (double)best_center,
+           (double)best_score,
+           (double)best_mean,
+           (double)best_width,
+           (unsigned long)best_count);
     return true;
 }
 
@@ -1444,6 +1606,197 @@ static bool run_best_window_scan(dpmzm_scan_request_t *scan_req,
     return true;
 }
 
+static bool run_turning_point_scan(dpmzm_scan_request_t *scan_req,
+                                   dpmzm_scan_stage_t stage,
+                                   dpmzm_scan_target_t target,
+                                   float center_v,
+                                   float fallback_window_v,
+                                   float final_window_v,
+                                   float final_step_v,
+                                   float turn_step_v,
+                                   int max_shifts,
+                                   float min_v,
+                                   float max_v,
+                                   float *best_v,
+                                   bool *edge_rescan_out)
+{
+    float center;
+    float bracket_center = 0.0f;
+    bool bracketed = false;
+    uint32_t attempt = 0U;
+    uint32_t hard_limit;
+
+    if (scan_req == NULL || best_v == NULL ||
+        turn_step_v <= 0.0f || final_step_v <= 0.0f) {
+        return false;
+    }
+
+    center = clamp_bias(center_v, min_v, max_v);
+    hard_limit = (uint32_t)ceilf((max_v - min_v) / turn_step_v) + 4U;
+    if (max_shifts >= 0 && (uint32_t)max_shifts < hard_limit) {
+        hard_limit = (uint32_t)max_shifts + 1U;
+    }
+
+    while (attempt < hard_limit) {
+        dpmzm_scan_summary_t summary;
+        uint32_t point_count = 0U;
+        float probe_center = center;
+        float start_v;
+        float stop_v;
+        float left_m;
+        float mid_m;
+        float right_m;
+        uint32_t mid_index;
+        uint32_t best_index;
+        float next_center;
+
+        if (probe_center - turn_step_v < min_v) {
+            probe_center = min_v + turn_step_v;
+        }
+        if (probe_center + turn_step_v > max_v) {
+            probe_center = max_v - turn_step_v;
+        }
+        probe_center = clamp_bias(probe_center, min_v, max_v);
+
+        start_v = clamp_bias(probe_center - turn_step_v, min_v, max_v);
+        stop_v = clamp_bias(probe_center + turn_step_v, min_v, max_v);
+        if (!run_collect_scan(scan_req,
+                              stage,
+                              target,
+                              start_v,
+                              stop_v,
+                              turn_step_v,
+                              &summary,
+                              &point_count)) {
+            return false;
+        }
+        if (point_count < 3U) {
+            break;
+        }
+
+        mid_index = 0U;
+        {
+            float best_delta = FLT_MAX;
+            uint32_t i;
+            for (i = 0U; i < point_count; i++) {
+                float delta = fabsf(s_scan_points[i].sweep_v - probe_center);
+                if (delta < best_delta) {
+                    best_delta = delta;
+                    mid_index = i;
+                }
+            }
+        }
+        if (mid_index == 0U || mid_index + 1U >= point_count) {
+            break;
+        }
+
+        left_m = metric_from_point(stage, target, &s_scan_points[mid_index - 1U]);
+        mid_m = metric_from_point(stage, target, &s_scan_points[mid_index]);
+        right_m = metric_from_point(stage, target, &s_scan_points[mid_index + 1U]);
+
+        printf("[dpmzm][auto] turn probe: stage=%s target=%s center=%+.3fV L=%.9f C=%.9f R=%.9f\r\n",
+               dpmzm_scan_stage_name(stage),
+               dpmzm_scan_target_name(target),
+               (double)probe_center,
+               (double)left_m,
+               (double)mid_m,
+               (double)right_m);
+
+        if (mid_m <= left_m && mid_m <= right_m) {
+            bracket_center = s_scan_points[mid_index].sweep_v;
+            bracketed = true;
+            printf("[dpmzm][auto] turn bracketed: stage=%s target=%s center=%+.3fV\r\n",
+                   dpmzm_scan_stage_name(stage),
+                   dpmzm_scan_target_name(target),
+                   (double)bracket_center);
+            break;
+        }
+
+        best_index = mid_index;
+        if (left_m < metric_from_point(stage, target, &s_scan_points[best_index])) {
+            best_index = mid_index - 1U;
+        }
+        if (right_m < metric_from_point(stage, target, &s_scan_points[best_index])) {
+            best_index = mid_index + 1U;
+        }
+
+        next_center = clamp_bias(s_scan_points[best_index].sweep_v, min_v, max_v);
+        printf("[dpmzm][auto] turn move: stage=%s target=%s %+.3fV -> %+.3fV\r\n",
+               dpmzm_scan_stage_name(stage),
+               dpmzm_scan_target_name(target),
+               (double)center,
+               (double)next_center);
+
+        if (fabsf(next_center - center) < 1e-6f ||
+            next_center <= min_v + 1e-6f ||
+            next_center >= max_v - 1e-6f) {
+            center = next_center;
+            break;
+        }
+
+        center = next_center;
+        attempt++;
+    }
+
+    if (!bracketed) {
+        bool edge = false;
+
+        printf("[dpmzm][auto] turn fallback: stage=%s target=%s center=%+.3fV range=%.3fV\r\n",
+               dpmzm_scan_stage_name(stage),
+               dpmzm_scan_target_name(target),
+               (double)center,
+               (double)fallback_window_v);
+        return run_best_window_scan(scan_req,
+                                    stage,
+                                    target,
+                                    center,
+                                    fallback_window_v,
+                                    final_step_v,
+                                    min_v,
+                                    max_v,
+                                    best_v,
+                                    edge_rescan_out != NULL ? edge_rescan_out : &edge);
+    }
+
+    if (!run_best_window_scan(scan_req,
+                              stage,
+                              target,
+                              bracket_center,
+                              final_window_v,
+                              final_step_v,
+                              min_v,
+                              max_v,
+                              best_v,
+                              edge_rescan_out)) {
+        return false;
+    }
+
+    if (edge_rescan_out != NULL && *edge_rescan_out) {
+        bool second_edge = false;
+        float rescanned_best = *best_v;
+
+        printf("[dpmzm][auto] turn fine edge rescan: stage=%s target=%s around=%+.3fV\r\n",
+               dpmzm_scan_stage_name(stage),
+               dpmzm_scan_target_name(target),
+               (double)rescanned_best);
+        if (!run_best_window_scan(scan_req,
+                                  stage,
+                                  target,
+                                  rescanned_best,
+                                  final_window_v,
+                                  final_step_v,
+                                  min_v,
+                                  max_v,
+                                  best_v,
+                                  &second_edge)) {
+            return false;
+        }
+        *edge_rescan_out = true;
+    }
+
+    return true;
+}
+
 static void print_matp_candidates(const char *label,
                                   const dpmzm_matp_candidate_t *candidates,
                                   uint32_t count)
@@ -1480,15 +1833,9 @@ bool dpmzm_auto_run_coarse(const dpmzm_auto_coarse_request_t *req,
     dpmzm_auto_coarse_result_t result;
     dpmzm_matp_candidate_t i_matp[DPMZM_AUTO_MATP_CANDIDATES_MAX];
     dpmzm_matp_candidate_t q_matp[DPMZM_AUTO_MATP_CANDIDATES_MAX];
-    dpmzm_sensitive_region_t i_main_region;
-    dpmzm_sensitive_region_t i_backup_region;
-    dpmzm_sensitive_region_t q_main_region;
-    dpmzm_sensitive_region_t q_backup_region;
     uint32_t point_count = 0U;
     uint32_t i_matp_count = 0U;
     uint32_t q_matp_count = 0U;
-    bool qtp_ok = false;
-    bool used_retry = false;
 
     if (!request_valid(req) || out == NULL) {
         return false;
@@ -1500,10 +1847,6 @@ bool dpmzm_auto_run_coarse(const dpmzm_auto_coarse_request_t *req,
     memset(&scan_req, 0, sizeof(scan_req));
     memset(i_matp, 0, sizeof(i_matp));
     memset(q_matp, 0, sizeof(q_matp));
-    memset(&i_main_region, 0, sizeof(i_main_region));
-    memset(&i_backup_region, 0, sizeof(i_backup_region));
-    memset(&q_main_region, 0, sizeof(q_main_region));
-    memset(&q_backup_region, 0, sizeof(q_backup_region));
     scan_req = req->scan_template;
 
     set_state(DPMZM_AUTO_SCAN_I_MATP);
@@ -1529,29 +1872,20 @@ bool dpmzm_auto_run_coarse(const dpmzm_auto_coarse_request_t *req,
                                            i_matp,
                                            DPMZM_AUTO_MATP_CANDIDATES_MAX);
     print_matp_candidates("I", i_matp, i_matp_count);
-    if (i_matp_count == 0U) {
-        result.error = DPMZM_AUTO_ERR_I_MATP_NOT_FOUND;
-        goto fail;
-    }
-    result.i_matp_ref_v = i_matp[0].bias_v;
-
     set_state(DPMZM_AUTO_PICK_I_PLATEAU);
-    if (!pick_sensitive_regions(s_scan_points,
-                                point_count,
-                                i_matp,
-                                i_matp_count,
-                                DPMZM_SCAN_TARGET_I,
-                                req->sweep_step_v,
-                                &i_main_region,
-                                &i_backup_region)) {
+    if (!pick_matp_high_power_platform(s_scan_points,
+                                       point_count,
+                                       DPMZM_SCAN_TARGET_I,
+                                       &result.i_pqtp_init_v)) {
         result.error = DPMZM_AUTO_ERR_I_PLATEAU_NOT_FOUND;
         goto fail;
     }
-    result.i_pqtp_init_v = i_main_region.plateau_center_v;
+    result.i_matp_ref_v = (i_matp_count > 0U) ? i_matp[0].bias_v : result.i_pqtp_init_v;
     printf("[dpmzm][auto] I plateau center: %+.3fV\r\n",
            (double)result.i_pqtp_init_v);
 
     set_state(DPMZM_AUTO_SCAN_Q_MATP);
+    scan_req.bias_i_v = result.i_pqtp_init_v;
     set_auto_scan_blocks(&scan_req,
                          DPMZM_SCAN_STAGE_MATP,
                          req->iq_blocks,
@@ -1574,29 +1908,18 @@ bool dpmzm_auto_run_coarse(const dpmzm_auto_coarse_request_t *req,
                                            q_matp,
                                            DPMZM_AUTO_MATP_CANDIDATES_MAX);
     print_matp_candidates("Q", q_matp, q_matp_count);
-    if (q_matp_count == 0U) {
-        result.error = DPMZM_AUTO_ERR_Q_MATP_NOT_FOUND;
-        goto fail;
-    }
-    result.q_matp_ref_v = q_matp[0].bias_v;
-
     set_state(DPMZM_AUTO_PICK_Q_PLATEAU);
-    if (!pick_sensitive_regions(s_scan_points,
-                                point_count,
-                                q_matp,
-                                q_matp_count,
-                                DPMZM_SCAN_TARGET_Q,
-                                req->sweep_step_v,
-                                &q_main_region,
-                                &q_backup_region)) {
+    if (!pick_matp_high_power_platform(s_scan_points,
+                                       point_count,
+                                       DPMZM_SCAN_TARGET_Q,
+                                       &result.q_pqtp_init_v)) {
         result.error = DPMZM_AUTO_ERR_Q_PLATEAU_NOT_FOUND;
         goto fail;
     }
-    result.q_pqtp_init_v = q_main_region.plateau_center_v;
+    result.q_matp_ref_v = (q_matp_count > 0U) ? q_matp[0].bias_v : result.q_pqtp_init_v;
     printf("[dpmzm][auto] Q plateau center: %+.3fV\r\n",
            (double)result.q_pqtp_init_v);
 
-retry_p_qtp:
     set_state(DPMZM_AUTO_SCAN_P_QTP);
     scan_req.bias_i_v = result.i_pqtp_init_v;
     scan_req.bias_q_v = result.q_pqtp_init_v;
@@ -1616,25 +1939,8 @@ retry_p_qtp:
         result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
         goto fail;
     }
-    qtp_ok = qtp_curve_usable(s_scan_points, point_count) &&
-             pick_qtp_best_point(s_scan_points, point_count, &result.p_qtp_coarse_v);
-    if (!qtp_ok) {
-        if (!used_retry && i_backup_region.valid) {
-            used_retry = true;
-            s_auto_ctx.retry_count = 1U;
-            result.i_pqtp_init_v = i_backup_region.plateau_center_v;
-            printf("[dpmzm][auto] retry P-QTP with I backup plateau: %+.3fV\r\n",
-                   (double)result.i_pqtp_init_v);
-            goto retry_p_qtp;
-        }
-        if (!used_retry && q_backup_region.valid) {
-            used_retry = true;
-            s_auto_ctx.retry_count = 1U;
-            result.q_pqtp_init_v = q_backup_region.plateau_center_v;
-            printf("[dpmzm][auto] retry P-QTP with Q backup plateau: %+.3fV\r\n",
-                   (double)result.q_pqtp_init_v);
-            goto retry_p_qtp;
-        }
+    if (!qtp_curve_usable(s_scan_points, point_count) ||
+        !pick_qtp_best_point(s_scan_points, point_count, &result.p_qtp_coarse_v)) {
         result.error = DPMZM_AUTO_ERR_P_QTP_INVALID;
         goto fail;
     }
@@ -1703,6 +2009,38 @@ retry_p_qtp:
     result.q_mitp_valid = true;
     printf("[dpmzm][auto] Q-MITP best: %+.3fV\r\n",
            (double)result.q_mitp_coarse_v);
+
+    /*
+     * Match the verified script flow: after I/Q have moved to their MITP
+     * branches, run one more full P-QTP pass. P sensitivity and branch shape
+     * can change noticeably after I/Q are no longer at the MATP seed plateau.
+     */
+    set_state(DPMZM_AUTO_SCAN_P_QTP);
+    scan_req.bias_i_v = result.i_mitp_coarse_v;
+    scan_req.bias_q_v = result.q_mitp_coarse_v;
+    scan_req.bias_p_v = result.p_qtp_coarse_v;
+    set_auto_scan_blocks(&scan_req,
+                         DPMZM_SCAN_STAGE_QTP,
+                         req->iq_blocks,
+                         req->p_blocks);
+    if (!run_collect_scan(&scan_req,
+                          DPMZM_SCAN_STAGE_QTP,
+                          DPMZM_SCAN_TARGET_P,
+                          req->sweep_min_v,
+                          req->sweep_max_v,
+                          req->sweep_step_v,
+                          &summary,
+                          &point_count)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    if (!qtp_curve_usable(s_scan_points, point_count) ||
+        !pick_qtp_best_point(s_scan_points, point_count, &result.p_qtp_coarse_v)) {
+        result.error = DPMZM_AUTO_ERR_P_QTP_INVALID;
+        goto fail;
+    }
+    printf("[dpmzm][auto] P-QTP best after MITP: %+.3fV\r\n",
+           (double)result.p_qtp_coarse_v);
 
     set_state(DPMZM_AUTO_DONE);
     result.error = DPMZM_AUTO_OK;
@@ -1779,21 +2117,23 @@ bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
                          DPMZM_SCAN_STAGE_QTP,
                          req->iq_blocks,
                          req->p_blocks);
-    if (!run_best_window_scan(&scan_req,
-                              DPMZM_SCAN_STAGE_QTP,
-                              DPMZM_SCAN_TARGET_P,
-                              p_final,
-                              req->wide_range_v,
-                              req->wide_step_v,
-                              req->sweep_min_v,
-                              req->sweep_max_v,
-                              &result.p_qtp_wide_v,
-                              &edge)) {
+    if (!run_turning_point_scan(&scan_req,
+                                DPMZM_SCAN_STAGE_QTP,
+                                DPMZM_SCAN_TARGET_P,
+                                p_final,
+                                req->p_fine_range_v,
+                                DPMZM_AUTO_TURN_FINAL_WINDOW_V,
+                                req->fine_step_v,
+                                DPMZM_AUTO_TURN_STEP_V,
+                                DPMZM_AUTO_P_TURN_MAX_SHIFTS,
+                                req->sweep_min_v,
+                                req->sweep_max_v,
+                                &result.p_qtp_wide_v,
+                                &edge)) {
         result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
         goto fail;
     }
     p_final = result.p_qtp_wide_v;
-    result.p_qtp_fine_v = p_final;
     result.p_qtp_valid = true;
 
     set_state(DPMZM_AUTO_FINE_SCAN_I_WIDE);
@@ -1805,21 +2145,23 @@ bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
                          DPMZM_SCAN_STAGE_MITP,
                          req->iq_blocks,
                          req->p_blocks);
-    if (!run_best_window_scan(&scan_req,
-                              DPMZM_SCAN_STAGE_MITP,
-                              DPMZM_SCAN_TARGET_I,
-                              i_final,
-                              req->wide_range_v,
-                              req->wide_step_v,
-                              req->sweep_min_v,
-                              req->sweep_max_v,
-                              &result.i_mitp_wide_v,
-                              &edge)) {
+    if (!run_turning_point_scan(&scan_req,
+                                DPMZM_SCAN_STAGE_MITP,
+                                DPMZM_SCAN_TARGET_I,
+                                i_final,
+                                req->iq_fine_range_v,
+                                DPMZM_AUTO_TURN_FINAL_WINDOW_V,
+                                req->fine_step_v,
+                                DPMZM_AUTO_TURN_STEP_V,
+                                DPMZM_AUTO_IQ_TURN_MAX_SHIFTS,
+                                req->sweep_min_v,
+                                req->sweep_max_v,
+                                &result.i_mitp_wide_v,
+                                &edge)) {
         result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
         goto fail;
     }
     i_final = result.i_mitp_wide_v;
-    result.i_mitp_fine_v = i_final;
     result.i_mitp_valid = true;
 
     set_state(DPMZM_AUTO_FINE_SCAN_Q_WIDE);
@@ -1831,28 +2173,105 @@ bool dpmzm_auto_run_fine(const dpmzm_auto_fine_request_t *req,
                          DPMZM_SCAN_STAGE_MITP,
                          req->iq_blocks,
                          req->p_blocks);
-    if (!run_best_window_scan(&scan_req,
-                              DPMZM_SCAN_STAGE_MITP,
-                              DPMZM_SCAN_TARGET_Q,
-                              q_final,
-                              req->wide_range_v,
-                              req->wide_step_v,
-                              req->sweep_min_v,
-                              req->sweep_max_v,
-                              &result.q_mitp_wide_v,
-                              &edge)) {
+    if (!run_turning_point_scan(&scan_req,
+                                DPMZM_SCAN_STAGE_MITP,
+                                DPMZM_SCAN_TARGET_Q,
+                                q_final,
+                                req->iq_fine_range_v,
+                                DPMZM_AUTO_TURN_FINAL_WINDOW_V,
+                                req->fine_step_v,
+                                DPMZM_AUTO_TURN_STEP_V,
+                                DPMZM_AUTO_IQ_TURN_MAX_SHIFTS,
+                                req->sweep_min_v,
+                                req->sweep_max_v,
+                                &result.q_mitp_wide_v,
+                                &edge)) {
         result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
         goto fail;
     }
     q_final = result.q_mitp_wide_v;
-    result.q_mitp_fine_v = q_final;
     result.q_mitp_valid = true;
 
-    /*
-     * Keep the selected P-QTP branch after I/Q refinement. A final full-range P
-     * pass is deliberately omitted because it can jump to another QTP branch
-     * and slows down the automatic fine workflow.
-     */
+    set_state(DPMZM_AUTO_FINE_SCAN_P_FINE);
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    set_auto_scan_blocks(&scan_req,
+                         DPMZM_SCAN_STAGE_QTP,
+                         req->iq_blocks,
+                         req->p_blocks);
+    if (!run_turning_point_scan(&scan_req,
+                                DPMZM_SCAN_STAGE_QTP,
+                                DPMZM_SCAN_TARGET_P,
+                                p_final,
+                                req->p_fine_range_v,
+                                DPMZM_AUTO_TURN_FINAL_WINDOW_V,
+                                req->fine_step_v,
+                                DPMZM_AUTO_TURN_STEP_V,
+                                DPMZM_AUTO_P_TURN_MAX_SHIFTS,
+                                req->sweep_min_v,
+                                req->sweep_max_v,
+                                &result.p_qtp_fine_v,
+                                &result.p_qtp_expanded)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    p_final = result.p_qtp_fine_v;
+
+    set_state(DPMZM_AUTO_FINE_SCAN_I_FINE);
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    set_auto_scan_blocks(&scan_req,
+                         DPMZM_SCAN_STAGE_MITP,
+                         req->iq_blocks,
+                         req->p_blocks);
+    if (!run_turning_point_scan(&scan_req,
+                                DPMZM_SCAN_STAGE_MITP,
+                                DPMZM_SCAN_TARGET_I,
+                                i_final,
+                                DPMZM_AUTO_PRELOCK_IQ_WINDOW_V,
+                                DPMZM_AUTO_PRELOCK_IQ_WINDOW_V,
+                                req->fine_step_v,
+                                DPMZM_AUTO_TURN_STEP_V,
+                                DPMZM_AUTO_IQ_TURN_MAX_SHIFTS,
+                                req->sweep_min_v,
+                                req->sweep_max_v,
+                                &result.i_mitp_fine_v,
+                                &result.i_mitp_expanded)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    i_final = result.i_mitp_fine_v;
+
+    set_state(DPMZM_AUTO_FINE_SCAN_Q_FINE);
+    if (!apply_fixed_biases(&scan_req, i_final, q_final, p_final)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    set_auto_scan_blocks(&scan_req,
+                         DPMZM_SCAN_STAGE_MITP,
+                         req->iq_blocks,
+                         req->p_blocks);
+    if (!run_turning_point_scan(&scan_req,
+                                DPMZM_SCAN_STAGE_MITP,
+                                DPMZM_SCAN_TARGET_Q,
+                                q_final,
+                                DPMZM_AUTO_PRELOCK_IQ_WINDOW_V,
+                                DPMZM_AUTO_PRELOCK_IQ_WINDOW_V,
+                                req->fine_step_v,
+                                DPMZM_AUTO_TURN_STEP_V,
+                                DPMZM_AUTO_IQ_TURN_MAX_SHIFTS,
+                                req->sweep_min_v,
+                                req->sweep_max_v,
+                                &result.q_mitp_fine_v,
+                                &result.q_mitp_expanded)) {
+        result.error = DPMZM_AUTO_ERR_SCAN_EXECUTION;
+        goto fail;
+    }
+    q_final = result.q_mitp_fine_v;
 
     set_state(DPMZM_AUTO_DONE);
     result.error = DPMZM_AUTO_OK;

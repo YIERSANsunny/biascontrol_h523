@@ -34,6 +34,10 @@ typedef struct {
     float deadband_rel;
     float min_bias_v;
     float max_bias_v;
+    float iq_anchor_window_v;
+    float p_anchor_window_v;
+    uint32_t iq_blocks;
+    uint32_t p_blocks;
     uint32_t loop_interval_ms;
 } dpmzm_lock_request_t;
 
@@ -80,6 +84,10 @@ typedef struct {
     float last_error_value;
     float last_step_v;
     float last_bias_v;
+    bool anchor_valid;
+    float anchor_i_v;
+    float anchor_q_v;
+    float anchor_p_v;
 } dpmzm_lock_context_t;
 
 void dpmzm_lock_init(void);
@@ -90,6 +98,7 @@ const char *dpmzm_lock_error_name(dpmzm_lock_error_t error);
 bool dpmzm_lock_axis_from_char(char c, dpmzm_lock_axis_t *axis_out);
 
 void dpmzm_lock_start(void);
+void dpmzm_lock_start_with_anchor(float bias_i_v, float bias_q_v, float bias_p_v);
 void dpmzm_lock_stop(void);
 dpmzm_lock_axis_t dpmzm_lock_next_axis(void);
 void dpmzm_lock_record_step(const dpmzm_lock_step_result_t *result);

@@ -351,6 +351,10 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
 
     point_base_biases(req, sweep_value, &base_vi, &base_vq, &base_vp);
     if (apply_scan_biases(req, base_vi, base_vq, base_vp) != 0) {
+        printf("[dpmzm][scan] ERROR: bias apply failed at %s-%s sweep=%+.3fV\r\n",
+               dpmzm_scan_stage_name(req->stage),
+               dpmzm_scan_target_name(req->target),
+               (double)sweep_value);
         return false;
     }
 
@@ -362,6 +366,10 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
      */
     if (!discard_settle_samples(DSP_GOERTZEL_BLOCK_SIZE *
                                 DPMZM_SCAN_DISCARD_BLOCKS_AFTER_SETTLE)) {
+        printf("[dpmzm][scan] ERROR: ADC discard failed at %s-%s sweep=%+.3fV\r\n",
+               dpmzm_scan_stage_name(req->stage),
+               dpmzm_scan_target_name(req->target),
+               (double)sweep_value);
         return false;
     }
 
@@ -414,11 +422,23 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
                 drive_vq += tone_gen_next(&tone_q);
 
                 if (apply_scan_biases(req, drive_vi, drive_vq, base_vp) != 0) {
+                    printf("[dpmzm][scan] ERROR: pilot bias apply failed at %s-%s sweep=%+.3fV block=%lu sample=%lu\r\n",
+                           dpmzm_scan_stage_name(req->stage),
+                           dpmzm_scan_target_name(req->target),
+                           (double)sweep_value,
+                           (unsigned long)b,
+                           (unsigned long)s);
                     return false;
                 }
             }
 
             if (!wait_and_read_sample(&sample_ac_v, &sample_dc_v)) {
+                printf("[dpmzm][scan] ERROR: ADC read failed at %s-%s sweep=%+.3fV block=%lu sample=%lu\r\n",
+                       dpmzm_scan_stage_name(req->stage),
+                       dpmzm_scan_target_name(req->target),
+                       (double)sweep_value,
+                       (unsigned long)b,
+                       (unsigned long)s);
                 return false;
             }
 
@@ -445,6 +465,11 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
         }
 
         if (!dpmzm_measure_finalize(&measure_ctx, &block_result)) {
+            printf("[dpmzm][scan] ERROR: measure finalize failed at %s-%s sweep=%+.3fV block=%lu\r\n",
+                   dpmzm_scan_stage_name(req->stage),
+                   dpmzm_scan_target_name(req->target),
+                   (double)sweep_value,
+                   (unsigned long)b);
             return false;
         }
 

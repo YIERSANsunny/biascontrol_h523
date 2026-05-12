@@ -5,17 +5,14 @@
 #include <string.h>
 
 #define DPMZM_LOCK_DBM_FLOOR_MW 1e-15f
-/*
- * A side probe must be convincingly better than the center point before the
- * loop is allowed to move. This keeps small measurement asymmetry/noise from
- * being integrated into a slow bias drift.
- */
-#define DPMZM_LOCK_MIN_SIDE_IMPROVEMENT_REL 0.20f
+#define DPMZM_LOCK_GRADIENT_EPS 1e-24f
 
 static dpmzm_lock_context_t s_lock_ctx;
-/* V3.1 anchor-guard trial: keep I/Q as scan anchors, continuously guard P-QTP only. */
+/* Coordinate descent around the auto-found anchor: P -> I -> Q -> ... */
 static const dpmzm_lock_axis_t s_lock_sequence[] = {
-    DPMZM_LOCK_AXIS_P
+    DPMZM_LOCK_AXIS_P,
+    DPMZM_LOCK_AXIS_I,
+    DPMZM_LOCK_AXIS_Q
 };
 
 static float clampf_local(float value, float min_v, float max_v)
@@ -59,6 +56,64 @@ static float axis_center_v(const dpmzm_scan_request_t *req,
     }
 }
 
+static float axis_anchor_v(dpmzm_lock_axis_t axis)
+{
+    switch (axis) {
+    case DPMZM_LOCK_AXIS_I:
+        return s_lock_ctx.anchor_i_v;
+    case DPMZM_LOCK_AXIS_Q:
+        return s_lock_ctx.anchor_q_v;
+    case DPMZM_LOCK_AXIS_P:
+        return s_lock_ctx.anchor_p_v;
+    default:
+        return 0.0f;
+    }
+}
+
+static float axis_anchor_window_v(const dpmzm_lock_request_t *req,
+                                  dpmzm_lock_axis_t axis)
+{
+    if (req == NULL) {
+        return 0.0f;
+    }
+
+    return axis == DPMZM_LOCK_AXIS_P ?
+           req->p_anchor_window_v :
+           req->iq_anchor_window_v;
+}
+
+static void axis_limits_for_request(const dpmzm_lock_request_t *req,
+                                    dpmzm_lock_axis_t axis,
+                                    float *min_out,
+                                    float *max_out)
+{
+    float min_v;
+    float max_v;
+
+    if (req == NULL || min_out == NULL || max_out == NULL) {
+        return;
+    }
+
+    min_v = req->min_bias_v;
+    max_v = req->max_bias_v;
+
+    if (s_lock_ctx.anchor_valid) {
+        const float anchor_v = axis_anchor_v(axis);
+        const float window_v = axis_anchor_window_v(req, axis);
+
+        min_v = fmaxf(min_v, anchor_v - window_v);
+        max_v = fminf(max_v, anchor_v + window_v);
+    }
+
+    if (max_v <= min_v) {
+        min_v = req->min_bias_v;
+        max_v = req->max_bias_v;
+    }
+
+    *min_out = min_v;
+    *max_out = max_v;
+}
+
 static void set_axis_stage_target(dpmzm_scan_request_t *req,
                                   dpmzm_lock_axis_t axis)
 {
@@ -84,6 +139,16 @@ static void set_axis_stage_target(dpmzm_scan_request_t *req,
     }
 }
 
+static uint32_t blocks_for_axis(const dpmzm_lock_request_t *req,
+                                dpmzm_lock_axis_t axis)
+{
+    if (req == NULL) {
+        return 1U;
+    }
+
+    return axis == DPMZM_LOCK_AXIS_P ? req->p_blocks : req->iq_blocks;
+}
+
 static float metric_for_axis(dpmzm_lock_axis_t axis,
                              const dpmzm_measurement_t *m)
 {
@@ -101,6 +166,11 @@ static float metric_for_axis(dpmzm_lock_axis_t axis,
     default:
         return FLT_MAX;
     }
+}
+
+static float objective_for_metric(float metric)
+{
+    return metric * metric;
 }
 
 static bool apply_center_biases(const dpmzm_scan_request_t *req)
@@ -124,6 +194,10 @@ static bool request_valid(const dpmzm_lock_request_t *req)
         req->max_step_v <= 0.0f ||
         req->deadband_rel < 0.0f ||
         req->scan_template.blocks == 0U ||
+        req->iq_blocks == 0U ||
+        req->p_blocks == 0U ||
+        req->iq_anchor_window_v <= 0.0f ||
+        req->p_anchor_window_v <= 0.0f ||
         req->scan_template.pilot_i_freq_hz <= 0.0f ||
         req->scan_template.pilot_q_freq_hz <= 0.0f ||
         req->max_bias_v <= req->min_bias_v) {
@@ -220,6 +294,19 @@ void dpmzm_lock_start(void)
     s_lock_ctx.state = DPMZM_LOCK_RUNNING;
     s_lock_ctx.error = DPMZM_LOCK_OK;
     s_lock_ctx.sequence_index = 0U;
+    s_lock_ctx.anchor_valid = false;
+}
+
+void dpmzm_lock_start_with_anchor(float bias_i_v, float bias_q_v, float bias_p_v)
+{
+    s_lock_ctx.enabled = true;
+    s_lock_ctx.state = DPMZM_LOCK_RUNNING;
+    s_lock_ctx.error = DPMZM_LOCK_OK;
+    s_lock_ctx.sequence_index = 0U;
+    s_lock_ctx.anchor_valid = true;
+    s_lock_ctx.anchor_i_v = bias_i_v;
+    s_lock_ctx.anchor_q_v = bias_q_v;
+    s_lock_ctx.anchor_p_v = bias_p_v;
 }
 
 void dpmzm_lock_stop(void)
@@ -279,6 +366,11 @@ bool dpmzm_lock_probe(const dpmzm_lock_request_t *req,
     dpmzm_measurement_t plus_m;
     dpmzm_measurement_t minus_m;
     float center_v;
+    float min_v;
+    float max_v;
+    float obj_center;
+    float obj_plus;
+    float obj_minus;
     float denom;
 
     if (out == NULL) {
@@ -297,15 +389,17 @@ bool dpmzm_lock_probe(const dpmzm_lock_request_t *req,
     point_req = req->scan_template;
     point_req.dump_mode = DPMZM_SCAN_DUMP_METRICS;
     set_axis_stage_target(&point_req, axis);
+    point_req.blocks = blocks_for_axis(req, axis);
 
     center_v = axis_center_v(&point_req, axis);
+    axis_limits_for_request(req, axis, &min_v, &max_v);
     out->center_v = center_v;
     out->plus_v = clampf_local(center_v + req->delta_v,
-                               req->min_bias_v,
-                               req->max_bias_v);
+                               min_v,
+                               max_v);
     out->minus_v = clampf_local(center_v - req->delta_v,
-                                req->min_bias_v,
-                                req->max_bias_v);
+                                min_v,
+                                max_v);
 
     if (!dpmzm_scan_measure_point(&point_req, out->plus_v, &plus_m)) {
         out->error_code = DPMZM_LOCK_ERR_MEASURE;
@@ -345,8 +439,12 @@ bool dpmzm_lock_probe(const dpmzm_lock_request_t *req,
         return false;
     }
 
-    if (out->metric_center <= out->metric_plus &&
-        out->metric_center <= out->metric_minus) {
+    obj_center = objective_for_metric(out->metric_center);
+    obj_plus = objective_for_metric(out->metric_plus);
+    obj_minus = objective_for_metric(out->metric_minus);
+
+    if (obj_center <= obj_plus &&
+        obj_center <= obj_minus) {
         /*
          * Near a sharp MITP/QTP valley, the two side probes can be asymmetric
          * even when the current center is already the best point. Without this
@@ -360,22 +458,8 @@ bool dpmzm_lock_probe(const dpmzm_lock_request_t *req,
         return true;
     }
 
-    {
-        const float best_side_metric = fminf(out->metric_plus, out->metric_minus);
-        const float improvement_rel =
-            (out->metric_center - best_side_metric) /
-            (out->metric_center + best_side_metric + 1e-12f);
-
-        if (improvement_rel < DPMZM_LOCK_MIN_SIDE_IMPROVEMENT_REL) {
-            out->error = 0.0f;
-            out->direction = "hold-weak";
-            out->valid = true;
-            return true;
-        }
-    }
-
-    denom = out->metric_plus + out->metric_minus + 1e-12f;
-    out->error = (out->metric_plus - out->metric_minus) / denom;
+    denom = obj_plus + obj_minus + DPMZM_LOCK_GRADIENT_EPS;
+    out->error = (obj_plus - obj_minus) / denom;
     if (fabsf(out->error) < req->deadband_rel) {
         out->direction = "hold";
     } else if (out->error > 0.0f) {
@@ -395,6 +479,8 @@ bool dpmzm_lock_step(const dpmzm_lock_request_t *req,
     float raw_step;
     float center_v;
     float new_bias_v;
+    float min_v;
+    float max_v;
 
     if (out == NULL) {
         return false;
@@ -409,6 +495,7 @@ bool dpmzm_lock_step(const dpmzm_lock_request_t *req,
     }
 
     center_v = out->probe.center_v;
+    axis_limits_for_request(req, axis, &min_v, &max_v);
     if (fabsf(out->probe.error) < req->deadband_rel) {
         raw_step = 0.0f;
         out->held_by_deadband = true;
@@ -421,7 +508,7 @@ bool dpmzm_lock_step(const dpmzm_lock_request_t *req,
                                        -fabsf(req->max_step_v),
                                        fabsf(req->max_step_v));
     new_bias_v = center_v + out->applied_step_v;
-    out->new_bias_v = clampf_local(new_bias_v, req->min_bias_v, req->max_bias_v);
+    out->new_bias_v = clampf_local(new_bias_v, min_v, max_v);
     out->clamped = fabsf(out->new_bias_v - new_bias_v) > 1e-6f;
     return true;
 }
@@ -489,4 +576,12 @@ void dpmzm_lock_print_status(void)
     printf("  last error:  %+.6f\r\n", (double)s_lock_ctx.last_error_value);
     printf("  last step:   %+.6fV\r\n", (double)s_lock_ctx.last_step_v);
     printf("  last bias:   %+.6fV\r\n", (double)s_lock_ctx.last_bias_v);
+    printf("  anchor:      %s", s_lock_ctx.anchor_valid ? "yes" : "no");
+    if (s_lock_ctx.anchor_valid) {
+        printf(" I=%+.3fV Q=%+.3fV P=%+.3fV",
+               (double)s_lock_ctx.anchor_i_v,
+               (double)s_lock_ctx.anchor_q_v,
+               (double)s_lock_ctx.anchor_p_v);
+    }
+    printf("\r\n");
 }

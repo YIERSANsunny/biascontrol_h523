@@ -204,4 +204,10 @@ void ads131m02_drdy_isr_handler(void);
  */
 void HAL_SPI_TxRxCpltCallback_ADC(SPI_HandleTypeDef *hspi);
 
+/**
+ * SPI2 error callback dispatcher.
+ * Restores ADC CS/state after a failed ADC SPI transaction.
+ */
+void HAL_SPI_ErrorCallback_ADC(SPI_HandleTypeDef *hspi);
+
 #endif /* DRV_ADS131M02_H */
