@@ -64,11 +64,36 @@ class GradientRecord:
     dbm_minus: float
     dbm_center: float
     dbm_plus: float
+    pd_dc_center: float
+    pd_dc_anchor: float
+    pd_dc_rise_db: float
+    pd_dc_rise_avg_db: float
+    pd_dc_trigger_count: int
     error: float
     requested_step_v: float
     applied_step_v: float
     new_bias_v: float
+    adaptive_scale: float
+    effective_gain_v: float
+    effective_max_step_v: float
+    dc_guard_event: str
     reason: str
+
+
+@dataclass
+class AxisAdaptiveState:
+    scale: float = 1.0
+    last_direction: int = 0
+    same_direction_count: int = 0
+
+
+@dataclass
+class DcGuardState:
+    anchor_dc: float | None = None
+    trigger_count: int = 0
+    cooldown_steps: int = 0
+    armed: bool = False
+    rise_history_db: list[float] | None = None
 
 
 def metric_to_dbm(vpeak: float) -> float:
@@ -124,6 +149,138 @@ def axis_config(axis: str, iq_blocks: int, p_blocks: int, iq_anchor_window: floa
     if axis == "p":
         return AxisConfig(stage="qtp", target="p", blocks=p_blocks, anchor_window_v=p_anchor_window)
     raise ValueError(f"unknown axis {axis}")
+
+
+def axis_gain(args: argparse.Namespace, axis: str) -> float:
+    value = {
+        "i": args.i_gain,
+        "q": args.q_gain,
+        "p": args.p_gain,
+    }.get(axis)
+    return args.gain if value is None else value
+
+
+def axis_max_step(args: argparse.Namespace, axis: str) -> float:
+    value = {
+        "i": args.i_max_step,
+        "q": args.q_max_step,
+        "p": args.p_max_step,
+    }.get(axis)
+    return args.max_step if value is None else value
+
+
+def effective_axis_gain(args: argparse.Namespace, axis: str, state: AxisAdaptiveState) -> float:
+    if not args.adaptive_step:
+        return axis_gain(args, axis)
+    return axis_gain(args, axis) * state.scale
+
+
+def effective_axis_max_step(args: argparse.Namespace, axis: str, state: AxisAdaptiveState) -> float:
+    base_max_step = axis_max_step(args, axis)
+    if not args.adaptive_step:
+        return base_max_step
+    return min(base_max_step * state.scale, args.adaptive_hard_max_step)
+
+
+def step_direction(step_v: float) -> int:
+    if step_v > 1e-9:
+        return 1
+    if step_v < -1e-9:
+        return -1
+    return 0
+
+
+def update_adaptive_state(
+    state: AxisAdaptiveState,
+    direction: int,
+    reason: str,
+    args: argparse.Namespace,
+) -> None:
+    if not args.adaptive_step:
+        return
+
+    if direction == 0 or reason.startswith("hold"):
+        state.same_direction_count = 0
+        if state.scale > 1.0:
+            state.scale = max(1.0, state.scale * args.adaptive_shrink)
+        return
+
+    if state.last_direction != 0 and direction != state.last_direction:
+        state.same_direction_count = 1
+        state.scale = max(args.adaptive_min_scale, state.scale * args.adaptive_shrink)
+    else:
+        state.same_direction_count += 1
+        if state.same_direction_count >= args.adaptive_same_direction:
+            state.scale = min(args.adaptive_max_scale, state.scale * args.adaptive_growth)
+
+    state.last_direction = direction
+
+
+def dc_rise_db(dc_now: float, dc_anchor: float, dc_floor: float) -> float:
+    ref = max(abs(dc_anchor), dc_floor)
+    ratio = abs(dc_now) / ref
+    return 20.0 * math.log10(max(ratio, 1e-12))
+
+
+def update_dc_rise_history(state: DcGuardState, rise_db: float, window: int) -> float:
+    if state.rise_history_db is None:
+        state.rise_history_db = []
+    state.rise_history_db.append(rise_db)
+    window = max(1, window)
+    if len(state.rise_history_db) > window:
+        del state.rise_history_db[:-window]
+    return sum(state.rise_history_db) / len(state.rise_history_db)
+
+
+def evaluate_dc_guard(
+    state: DcGuardState,
+    dc_now: float,
+    args: argparse.Namespace,
+) -> tuple[float, float, float, int, bool, str]:
+    if state.anchor_dc is None:
+        state.anchor_dc = dc_now
+
+    anchor_dc = state.anchor_dc
+    rise_db = dc_rise_db(dc_now, anchor_dc, args.dc_guard_floor)
+    avg_rise_db = update_dc_rise_history(state, rise_db, args.dc_guard_avg_window)
+    event = "disabled"
+    trigger = False
+
+    if not args.dc_guard:
+        return anchor_dc, rise_db, avg_rise_db, state.trigger_count, False, event
+
+    if state.cooldown_steps > 0:
+        state.cooldown_steps -= 1
+        event = "cooldown"
+        return anchor_dc, rise_db, avg_rise_db, state.trigger_count, False, event
+
+    # Hysteresis: rising average arms the guard, but it is only released after
+    # the averaged rise falls below a lower release threshold.
+    if avg_rise_db <= args.dc_guard_release_db:
+        state.armed = False
+        state.trigger_count = 0
+        event = "ok"
+        return anchor_dc, rise_db, avg_rise_db, state.trigger_count, False, event
+
+    if avg_rise_db <= args.dc_guard_threshold_db and not state.armed:
+        state.trigger_count = 0
+        event = "ok"
+        return anchor_dc, rise_db, avg_rise_db, state.trigger_count, False, event
+
+    if avg_rise_db > args.dc_guard_threshold_db:
+        state.armed = True
+    elif state.armed:
+        event = "armed"
+        return anchor_dc, rise_db, avg_rise_db, state.trigger_count, False, event
+
+    state.trigger_count += 1
+    event = "rise"
+    if state.trigger_count >= args.dc_guard_trigger_count:
+        trigger = True
+        event = "trigger"
+        state.trigger_count = 0
+        state.cooldown_steps = args.dc_guard_cooldown_steps
+    return anchor_dc, rise_db, avg_rise_db, state.trigger_count, trigger, event
 
 
 def apply_bias(session: SerialSession, axis: str, value: float, wait_s: float = 0.15) -> None:
@@ -191,8 +348,10 @@ def run_gradient_step(
     axis: str,
     bias: BiasPoint,
     anchor: BiasPoint,
+    adaptive_state: AxisAdaptiveState,
+    dc_guard_state: DcGuardState,
     args: argparse.Namespace,
-) -> tuple[BiasPoint, GradientRecord]:
+) -> tuple[BiasPoint, GradientRecord, bool]:
     config = axis_config(axis, args.iq_blocks, args.p_blocks, args.iq_anchor_window, args.p_anchor_window)
     center_v = axis_value(bias, axis)
     anchor_v = axis_value(anchor, axis)
@@ -214,10 +373,18 @@ def run_gradient_step(
     obj_minus = objective_from_metric(metric_minus, args.use_power)
     obj_center = objective_from_metric(metric_center, args.use_power)
     obj_plus = objective_from_metric(metric_plus, args.use_power)
+    pd_dc_anchor, pd_dc_rise, pd_dc_rise_avg, pd_dc_count, dc_guard_trigger, dc_guard_event = evaluate_dc_guard(
+        dc_guard_state,
+        row_center.dc,
+        args,
+    )
 
     denom = obj_plus + obj_minus + 1e-24
     error = (obj_plus - obj_minus) / denom
-    requested_step = -args.gain * error
+    scale_used = adaptive_state.scale
+    gain = effective_axis_gain(args, axis, adaptive_state)
+    max_step = effective_axis_max_step(args, axis, adaptive_state)
+    requested_step = -gain * error
     reason = "gradient"
 
     if obj_center <= obj_minus and obj_center <= obj_plus:
@@ -227,17 +394,22 @@ def run_gradient_step(
         requested_step = 0.0
         reason = "hold-deadband"
 
-    applied_step = clamp(requested_step, -abs(args.max_step), abs(args.max_step))
-    new_v = clamp(center_v + applied_step, min_v, max_v)
-    if abs(new_v - (center_v + applied_step)) > 1e-9:
+    limited_step = clamp(requested_step, -abs(max_step), abs(max_step))
+    new_v = clamp(center_v + limited_step, min_v, max_v)
+    applied_step = new_v - center_v
+    if abs(applied_step - limited_step) > 1e-9:
         reason += "+anchor-clamp"
     new_bias = set_axis_value(bias, axis, new_v)
+    update_adaptive_state(adaptive_state, step_direction(applied_step), reason, args)
 
     apply_bias(session, axis, new_v)
     session.progress(
         f"grad step {step_index:03d} axis={axis} center={center_v:+.4f}V "
         f"J-={metric_to_dbm(metric_minus):+.2f}dBm J0={metric_to_dbm(metric_center):+.2f}dBm "
         f"J+={metric_to_dbm(metric_plus):+.2f}dBm e={error:+.4f} "
+        f"dc={row_center.dc:+.6f}V rise={pd_dc_rise:+.2f}dB avg={pd_dc_rise_avg:+.2f}dB "
+        f"guard={dc_guard_event}/{pd_dc_count} "
+        f"gain={gain:.4f}V max={max_step:.4f}V scale={scale_used:.2f}->{adaptive_state.scale:.2f} "
         f"step={applied_step:+.5f}V -> {new_v:+.4f}V {reason}"
     )
 
@@ -259,12 +431,112 @@ def run_gradient_step(
         dbm_minus=metric_to_dbm(metric_minus),
         dbm_center=metric_to_dbm(metric_center),
         dbm_plus=metric_to_dbm(metric_plus),
+        pd_dc_center=row_center.dc,
+        pd_dc_anchor=pd_dc_anchor,
+        pd_dc_rise_db=pd_dc_rise,
+        pd_dc_rise_avg_db=pd_dc_rise_avg,
+        pd_dc_trigger_count=pd_dc_count,
         error=error,
         requested_step_v=requested_step,
         applied_step_v=applied_step,
         new_bias_v=new_v,
+        adaptive_scale=scale_used,
+        effective_gain_v=gain,
+        effective_max_step_v=max_step,
+        dc_guard_event=dc_guard_event,
         reason=reason,
+    ), dc_guard_trigger
+
+
+def local_sweep_values(center: float, window: float, step: float, min_v: float, max_v: float) -> list[float]:
+    start = clamp(center - abs(window), min_v, max_v)
+    stop = clamp(center + abs(window), min_v, max_v)
+    step = abs(step)
+    if step <= 0.0:
+        raise ValueError("local sweep step must be positive")
+    values: list[float] = []
+    value = start
+    while value <= stop + step * 0.5:
+        values.append(clamp(round(value, 6), min_v, max_v))
+        value += step
+    if not values or abs(values[-1] - stop) > step * 0.25:
+        values.append(stop)
+    return sorted(set(values))
+
+
+def choose_recheck_row(rows: list[MetricRow], dc_limit_abs: float, args: argparse.Namespace) -> MetricRow:
+    valid_rows = [row for row in rows if abs(row.dc) <= dc_limit_abs]
+    candidates = valid_rows if valid_rows else rows
+    return min(candidates, key=lambda row: objective_from_metric(metric_value(row), args.use_power))
+
+
+def run_dc_guard_recheck(
+    session: SerialSession,
+    bias: BiasPoint,
+    anchor: BiasPoint,
+    dc_guard_state: DcGuardState,
+    args: argparse.Namespace,
+) -> BiasPoint:
+    if not args.dc_guard_recheck_sequence:
+        return bias
+
+    ref_abs = max(abs(dc_guard_state.anchor_dc or 0.0), args.dc_guard_floor)
+    dc_limit_abs = ref_abs * (10.0 ** (args.dc_guard_threshold_db / 20.0))
+    session.progress(
+        "dc guard recheck start: "
+        f"anchor_dc={dc_guard_state.anchor_dc:+.6f}V limit_abs={dc_limit_abs:.6f}V "
+        f"sequence={args.dc_guard_recheck_sequence}"
     )
+
+    best_dc_for_anchor: float | None = None
+    for axis in [char.lower() for char in args.dc_guard_recheck_sequence if char.lower() in {"i", "q", "p"}]:
+        config = axis_config(axis, args.iq_blocks, args.p_blocks, args.iq_anchor_window, args.p_anchor_window)
+        center_v = axis_value(bias, axis)
+        anchor_v = axis_value(anchor, axis)
+        min_v = max(args.min_bias, anchor_v - config.anchor_window_v)
+        max_v = min(args.max_bias, anchor_v + config.anchor_window_v)
+        window = args.dc_recheck_p_window if axis == "p" else args.dc_recheck_iq_window
+        values = local_sweep_values(center_v, window, args.dc_recheck_step, min_v, max_v)
+
+        rows: list[MetricRow] = []
+        for index, value in enumerate(values, start=1):
+            row = measure_single_point(
+                session,
+                config,
+                value,
+                f"dcguard {axis} {index:02d}/{len(values):02d}",
+                args.point_timeout,
+            )
+            rows.append(row)
+
+        selected = choose_recheck_row(rows, dc_limit_abs, args)
+        selected_metric = metric_value(selected)
+        selected_dbm = metric_to_dbm(selected_metric)
+        valid_count = sum(1 for row in rows if abs(row.dc) <= dc_limit_abs)
+        session.progress(
+            f"dc guard recheck axis={axis}: points={len(rows)} valid_dc={valid_count} "
+            f"select {selected.sweep:+.4f}V metric={selected_dbm:+.2f}dBm dc={selected.dc:+.6f}V"
+        )
+        apply_bias(session, axis, selected.sweep, wait_s=0.25)
+        bias = set_axis_value(bias, axis, selected.sweep)
+
+        if best_dc_for_anchor is None or abs(selected.dc) < abs(best_dc_for_anchor):
+            best_dc_for_anchor = selected.dc
+
+    if args.dc_guard_update_anchor and best_dc_for_anchor is not None:
+        old_anchor = dc_guard_state.anchor_dc
+        old_ref = max(abs(old_anchor or 0.0), args.dc_guard_floor)
+        if old_anchor is None or abs(best_dc_for_anchor) <= old_ref:
+            dc_guard_state.anchor_dc = best_dc_for_anchor
+            session.progress(
+                f"dc guard anchor updated: {old_anchor!s} -> {dc_guard_state.anchor_dc:+.6f}V"
+            )
+        else:
+            session.progress(
+                f"dc guard anchor kept: {old_anchor:+.6f}V, recheck best dc={best_dc_for_anchor:+.6f}V"
+            )
+
+    return bias
 
 
 def write_gradient_csv(path: Path, records: list[GradientRecord]) -> None:
@@ -290,10 +562,19 @@ def write_gradient_csv(path: Path, records: list[GradientRecord]) -> None:
                 "dbm_minus",
                 "dbm_center",
                 "dbm_plus",
+                "pd_dc_center",
+                "pd_dc_anchor",
+                "pd_dc_rise_db",
+                "pd_dc_rise_avg_db",
+                "pd_dc_trigger_count",
                 "error",
                 "requested_step_v",
                 "applied_step_v",
                 "new_bias_v",
+                "adaptive_scale",
+                "effective_gain_v",
+                "effective_max_step_v",
+                "dc_guard_event",
                 "reason",
             ]
         )
@@ -316,10 +597,19 @@ def write_gradient_csv(path: Path, records: list[GradientRecord]) -> None:
                 f"{record.dbm_minus:.3f}",
                 f"{record.dbm_center:.3f}",
                 f"{record.dbm_plus:.3f}",
+                f"{record.pd_dc_center:.9f}",
+                f"{record.pd_dc_anchor:.9f}",
+                f"{record.pd_dc_rise_db:.3f}",
+                f"{record.pd_dc_rise_avg_db:.3f}",
+                record.pd_dc_trigger_count,
                 f"{record.error:.9f}",
                 f"{record.requested_step_v:.6f}",
                 f"{record.applied_step_v:.6f}",
                 f"{record.new_bias_v:.6f}",
+                f"{record.adaptive_scale:.6f}",
+                f"{record.effective_gain_v:.6f}",
+                f"{record.effective_max_step_v:.6f}",
+                record.dc_guard_event,
                 record.reason,
             ])
 
@@ -330,7 +620,7 @@ def plot_gradient(path: Path, records: list[GradientRecord], title: str) -> Path
     path.parent.mkdir(parents=True, exist_ok=True)
     x = [record.step_index for record in records]
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
     fig.suptitle(title)
 
     axes[0].plot(x, [record.bias_i for record in records], marker="o", label="I bias")
@@ -356,6 +646,18 @@ def plot_gradient(path: Path, records: list[GradientRecord], title: str) -> Path
     axes[2].grid(True, alpha=0.3)
     axes[2].legend()
 
+    axes[3].plot(x, [record.pd_dc_center for record in records], marker="o", label="PD DC center (V)")
+    axes[3].set_xlabel("Gradient step")
+    axes[3].set_ylabel("PD DC (V)")
+    axes[3].grid(True, alpha=0.3)
+    axes3b = axes[3].twinx()
+    axes3b.plot(x, [record.pd_dc_rise_db for record in records], color="tab:red", marker="s", alpha=0.35, label="PD DC rise raw (dB)")
+    axes3b.plot(x, [record.pd_dc_rise_avg_db for record in records], color="tab:red", linewidth=2.0, label="PD DC rise avg (dB)")
+    axes3b.set_ylabel("Rise vs anchor (dB)")
+    lines, labels = axes[3].get_legend_handles_labels()
+    lines2, labels2 = axes3b.get_legend_handles_labels()
+    axes[3].legend(lines + lines2, labels + labels2, loc="best")
+
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -374,6 +676,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delta", type=float, default=0.01, help="Probe half-step in volts.")
     parser.add_argument("--gain", type=float, default=0.003, help="Gradient gain in volts.")
     parser.add_argument("--max-step", type=float, default=0.003, help="Maximum applied update in volts.")
+    parser.add_argument("--i-gain", type=float, default=None, help="Override I-axis gradient gain in volts.")
+    parser.add_argument("--q-gain", type=float, default=None, help="Override Q-axis gradient gain in volts.")
+    parser.add_argument("--p-gain", type=float, default=None, help="Override P-axis gradient gain in volts.")
+    parser.add_argument("--i-max-step", type=float, default=None, help="Override I-axis maximum update in volts.")
+    parser.add_argument("--q-max-step", type=float, default=None, help="Override Q-axis maximum update in volts.")
+    parser.add_argument("--p-max-step", type=float, default=None, help="Override P-axis maximum update in volts.")
+    adaptive_group = parser.add_mutually_exclusive_group()
+    adaptive_group.add_argument("--adaptive-step", dest="adaptive_step", action="store_true")
+    adaptive_group.add_argument("--no-adaptive-step", dest="adaptive_step", action="store_false")
+    parser.add_argument("--adaptive-hard-max-step", type=float, default=0.010, help="Hard cap for adaptive per-axis update in volts.")
+    parser.add_argument("--adaptive-min-scale", type=float, default=0.5, help="Minimum adaptive gain/max-step scale.")
+    parser.add_argument("--adaptive-max-scale", type=float, default=4.0, help="Maximum adaptive gain/max-step scale before hard cap.")
+    parser.add_argument("--adaptive-growth", type=float, default=1.5, help="Scale multiplier after repeated same-direction moves.")
+    parser.add_argument("--adaptive-shrink", type=float, default=0.5, help="Scale multiplier after hold or direction reversal.")
+    parser.add_argument("--adaptive-same-direction", type=int, default=3, help="Repeated same-direction moves before adaptive growth.")
+    dc_guard_group = parser.add_mutually_exclusive_group()
+    dc_guard_group.add_argument("--dc-guard", dest="dc_guard", action="store_true")
+    dc_guard_group.add_argument("--no-dc-guard", dest="dc_guard", action="store_false")
+    parser.add_argument("--dc-guard-threshold-db", type=float, default=4.0, help="Arm/trigger when averaged PD DC rise exceeds this many dB.")
+    parser.add_argument("--dc-guard-release-db", type=float, default=2.0, help="Release DC guard only after averaged PD DC rise falls below this many dB.")
+    parser.add_argument("--dc-guard-avg-window", type=int, default=5, help="Sliding average window for PD DC rise in gradient samples.")
+    parser.add_argument("--dc-guard-trigger-count", type=int, default=3, help="Consecutive averaged PD DC rise detections required before recheck.")
+    parser.add_argument("--dc-guard-floor", type=float, default=1e-5, help="Minimum absolute PD DC reference in volts.")
+    parser.add_argument("--dc-guard-cooldown-steps", type=int, default=12, help="Gradient steps to wait after one DC-guard recheck.")
+    parser.add_argument("--dc-guard-recheck-sequence", default="iqp", help="Axes to locally recheck after a PD DC guard trigger.")
+    parser.add_argument("--dc-recheck-iq-window", type=float, default=0.08, help="I/Q local recheck half-window in volts.")
+    parser.add_argument("--dc-recheck-p-window", type=float, default=0.10, help="P local recheck half-window in volts.")
+    parser.add_argument("--dc-recheck-step", type=float, default=0.01, help="Local recheck step in volts.")
+    parser.add_argument("--dc-guard-update-anchor", action="store_true", help="Allow PD DC anchor to update after a successful recheck.")
     parser.add_argument("--deadband", type=float, default=0.03, help="Normalized gradient deadband.")
     parser.add_argument("--iq-blocks", type=int, default=4)
     parser.add_argument("--p-blocks", type=int, default=10)
@@ -395,7 +726,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-p", type=float, default=None)
     parser.add_argument("--use-magnitude", dest="use_power", action="store_false")
     parser.add_argument("--no-plot", action="store_true")
-    parser.set_defaults(use_power=True)
+    parser.set_defaults(use_power=True, adaptive_step=False, dc_guard=False)
     return parser.parse_args()
 
 
@@ -414,6 +745,8 @@ def main() -> int:
     image_path = args.plot_dir / f"{stamp}_dpmzm_gradient_lock_steps.png"
 
     records: list[GradientRecord] = []
+    adaptive_states = {axis: AxisAdaptiveState() for axis in ("p", "i", "q")}
+    dc_guard_state = DcGuardState()
     exit_code = 0
 
     try:
@@ -452,13 +785,30 @@ def main() -> int:
             anchor = BiasPoint(i=bias.i, q=bias.q, p=bias.p)
             session.progress(
                 f"gradient anchor: I={anchor.i:+.4f}V Q={anchor.q:+.4f}V P={anchor.p:+.4f}V; "
-                f"sequence={''.join(axes)} delta={args.delta:.4f}V gain={args.gain:.4f}V"
+                f"sequence={''.join(axes)} delta={args.delta:.4f}V "
+                f"gain I/Q/P={axis_gain(args, 'i'):.4f}/{axis_gain(args, 'q'):.4f}/{axis_gain(args, 'p'):.4f}V "
+                f"max_step I/Q/P={axis_max_step(args, 'i'):.4f}/{axis_max_step(args, 'q'):.4f}/{axis_max_step(args, 'p'):.4f}V "
+                f"adaptive={'on' if args.adaptive_step else 'off'} hard_max={args.adaptive_hard_max_step:.4f}V "
+                f"dc_guard={'on' if args.dc_guard else 'off'} threshold={args.dc_guard_threshold_db:.1f}dB"
             )
 
             for step_index in range(1, args.cycles + 1):
                 axis = axes[(step_index - 1) % len(axes)]
-                bias, record = run_gradient_step(session, step_index, axis, bias, anchor, args)
+                bias, record, dc_guard_trigger = run_gradient_step(
+                    session,
+                    step_index,
+                    axis,
+                    bias,
+                    anchor,
+                    adaptive_states[axis],
+                    dc_guard_state,
+                    args,
+                )
                 records.append(record)
+                if dc_guard_trigger:
+                    record.dc_guard_event = "trigger-recheck"
+                    record.reason += "+dc-guard-recheck"
+                    bias = run_dc_guard_recheck(session, bias, anchor, dc_guard_state, args)
 
             write_gradient_csv(csv_path, records)
             session.progress(f"gradient csv saved: {csv_path}")
