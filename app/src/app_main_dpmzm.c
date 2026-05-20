@@ -8,6 +8,7 @@
 #include "drv_dac8568.h"
 #include "spi.h"
 #include "tim.h"
+#include "usart.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -651,6 +652,122 @@ static void print_status(void)
            dump_mode_name(s_dpmzm_ctx.config->dump_mode));
     printf("  scan blocks:   %lu\r\n",
            (unsigned long)s_dpmzm_ctx.config->scan_default_blocks);
+}
+
+static void print_debug(void)
+{
+    dpmzm_scan_trace_t scan_trace;
+    const dpmzm_lock_context_t *lock_ctx = dpmzm_lock_get_context();
+    uint32_t now_ms = HAL_GetTick();
+    uint32_t tim6_irq_count;
+    uint32_t dma_schedule_count;
+    uint32_t dma_drop_count;
+    uint32_t dma_error_count;
+    bool pilot_dma_active;
+    uint8_t pilot_dma_frame_count;
+    uint8_t pilot_dma_frame_index;
+    bool pilot_dma_contains_p;
+    uint32_t scan_age_ms;
+    uint32_t phase_age_ms;
+
+    dpmzm_scan_trace_snapshot(&scan_trace);
+
+    __disable_irq();
+    tim6_irq_count = s_pilot_tim6_irq_count;
+    dma_schedule_count = s_pilot_dma_schedule_count;
+    dma_drop_count = s_pilot_dma_drop_count;
+    dma_error_count = s_pilot_dma_error_count;
+    pilot_dma_active = s_pilot_dma_active;
+    pilot_dma_frame_count = s_pilot_dma_frame_count;
+    pilot_dma_frame_index = s_pilot_dma_frame_index;
+    pilot_dma_contains_p = s_pilot_dma_contains_p;
+    __enable_irq();
+
+    scan_age_ms = scan_trace.start_tick_ms == 0U ? 0U : now_ms - scan_trace.start_tick_ms;
+    phase_age_ms = scan_trace.phase_tick_ms == 0U ? 0U : now_ms - scan_trace.phase_tick_ms;
+
+    printf("[dpmzm] debug\r\n");
+    printf("  tick:        %lu ms\r\n", (unsigned long)now_ms);
+    printf("  scan:        running=%s gen=%lu phase=%s last_error=%s\r\n",
+           scan_trace.running ? "yes" : "no",
+           (unsigned long)scan_trace.generation,
+           dpmzm_scan_trace_phase_name(scan_trace.phase),
+           dpmzm_scan_trace_error_name(scan_trace.last_error));
+    printf("  scan target: %s-%s sweep=%+.6fV index=%lu blocks=%lu/%lu sample=%lu/%lu\r\n",
+           dpmzm_scan_stage_name(scan_trace.stage),
+           dpmzm_scan_target_name(scan_trace.target),
+           (double)scan_trace.sweep_v,
+           (unsigned long)scan_trace.sweep_index,
+           (unsigned long)scan_trace.block_index,
+           (unsigned long)scan_trace.requested_blocks,
+           (unsigned long)scan_trace.sample_index,
+           (unsigned long)scan_trace.samples_per_block);
+    printf("  scan bias:   I=%+.6fV Q=%+.6fV P=%+.6fV pilot=%s dump=%lu\r\n",
+           (double)scan_trace.base_i_v,
+           (double)scan_trace.base_q_v,
+           (double)scan_trace.base_p_v,
+           dpmzm_scan_pilot_mode_name(scan_trace.pilot_mode),
+           (unsigned long)scan_trace.dump_mode);
+    printf("  scan timing: age=%lu ms phase_age=%lu ms start=%lu phase_tick=%lu last=%lu\r\n",
+           (unsigned long)scan_age_ms,
+           (unsigned long)phase_age_ms,
+           (unsigned long)scan_trace.start_tick_ms,
+           (unsigned long)scan_trace.phase_tick_ms,
+           (unsigned long)scan_trace.last_tick_ms);
+    printf("  scan counts: ok=%lu fail=%lu bias=%lu drdy_to=%lu adc=%lu discard=%lu pilot_bias=%lu finalize=%lu overflow=%lu\r\n",
+           (unsigned long)scan_trace.success_count,
+           (unsigned long)scan_trace.failure_count,
+           (unsigned long)scan_trace.bias_apply_fail_count,
+           (unsigned long)scan_trace.adc_drdy_timeout_count,
+           (unsigned long)scan_trace.adc_read_fail_count,
+           (unsigned long)scan_trace.discard_fail_count,
+           (unsigned long)scan_trace.pilot_bias_apply_fail_count,
+           (unsigned long)scan_trace.finalize_fail_count,
+           (unsigned long)scan_trace.point_overflow_fail_count);
+    printf("  pilot:       timer=%s tim6_state=%lu dma=%s frame=%u/%u pframe=%s irq=%lu sched=%lu drops=%lu errors=%lu\r\n",
+           s_pilot_timer_running ? "running" : "stopped",
+           (unsigned long)htim6.State,
+           pilot_dma_active ? "active" : "idle",
+           (unsigned)pilot_dma_frame_index,
+           (unsigned)pilot_dma_frame_count,
+           pilot_dma_contains_p ? "yes" : "no",
+           (unsigned long)tim6_irq_count,
+           (unsigned long)dma_schedule_count,
+           (unsigned long)dma_drop_count,
+           (unsigned long)dma_error_count);
+    printf("  hal:         spi_state=%lu spi_err=0x%08lx spi_sr=0x%08lx uart_g=%lu uart_rx=%lu uart_err=0x%08lx tim6_cr1=0x%08lx tim6_sr=0x%08lx tim6_cnt=%lu\r\n",
+           (unsigned long)hspi1.State,
+           (unsigned long)hspi1.ErrorCode,
+           (unsigned long)hspi1.Instance->SR,
+           (unsigned long)huart1.gState,
+           (unsigned long)huart1.RxState,
+           (unsigned long)huart1.ErrorCode,
+           (unsigned long)htim6.Instance->CR1,
+           (unsigned long)htim6.Instance->SR,
+           (unsigned long)__HAL_TIM_GET_COUNTER(&htim6));
+    printf("  lock:        state=%s enabled=%s busy=%s updates=%lu holds=%lu faults=%lu\r\n",
+           lock_ctx == NULL ? "NULL" : dpmzm_lock_state_name(lock_ctx->state),
+           (lock_ctx != NULL && lock_ctx->enabled) ? "yes" : "no",
+           s_lock_cycle_busy ? "yes" : "no",
+           lock_ctx == NULL ? 0UL : (unsigned long)lock_ctx->update_count,
+           lock_ctx == NULL ? 0UL : (unsigned long)lock_ctx->hold_count,
+           lock_ctx == NULL ? 0UL : (unsigned long)lock_ctx->fault_count);
+
+    printf("DPMZMDEBUG,scan,%s,%lu,%s,%s,%s,%s,%.6f,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+           scan_trace.running ? "running" : "idle",
+           (unsigned long)scan_trace.generation,
+           dpmzm_scan_trace_phase_name(scan_trace.phase),
+           dpmzm_scan_trace_error_name(scan_trace.last_error),
+           dpmzm_scan_stage_name(scan_trace.stage),
+           dpmzm_scan_target_name(scan_trace.target),
+           (double)scan_trace.sweep_v,
+           (unsigned long)scan_trace.sweep_index,
+           (unsigned long)scan_trace.block_index,
+           (unsigned long)scan_trace.sample_index,
+           (unsigned long)scan_age_ms,
+           (unsigned long)phase_age_ms,
+           (unsigned long)scan_trace.success_count,
+           (unsigned long)scan_trace.failure_count);
 }
 
 static void handle_set_pilot_open(const char *cmd)
@@ -1611,6 +1728,8 @@ void app_dpmzm_handle_command(const char *cmd)
 
     if (strcmp(cmd, "status") == 0) {
         print_status();
+    } else if (strcmp(cmd, "debug") == 0 || strcmp(cmd, "scan debug") == 0) {
+        print_debug();
     } else if (strncmp(cmd, "set bias ", 9) == 0) {
         handle_set_bias(cmd);
     } else if (strncmp(cmd, "set pilot-src ", 14) == 0) {

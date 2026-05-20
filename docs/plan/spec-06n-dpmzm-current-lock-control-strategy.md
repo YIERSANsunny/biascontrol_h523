@@ -1176,3 +1176,168 @@ grad 337 p center still running, elapsed 40s
 2. 继续记录光谱仪载波功率，并和 `pd_dc_rise_avg_db` 对齐，验证 PD DC 是否能可靠代理载波恶化。
 3. 如果后续确实观察到 DC guard 频繁触发且有效，再考虑把“触发式小窗复查”升级为固件内的保护状态机。
 4. 暂时不要把 DC guard 误认为主控制器；目前主控制器仍是三点小窗梯度法。
+
+## 22. 2026-05-20 阶段性验证结论
+
+### 22.1 本阶段核心改动
+
+本阶段继续保留“固件自动找点 + PC 侧梯度闭环”的总体结构，但对 PC 侧闭环脚本做了两类增强:
+
+1. 增加 `still running` 自动诊断: 当脚本等待某个扫描点长时间未返回时，自动发送 `dpmzm debug`，用于判断固件当前状态。
+2. 增加边界触发式小窗复查: 当 I/Q 轴连续被锚点窗口夹住，并且中心频点指标明显变差时，自动围绕当前边界做一次局部扫描，更新该轴 anchor。
+
+当前推荐入口仍然是:
+
+```bat
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\biascontrol_h523\tools\run_dpmzm_auto_then_gradient_com8.bat
+```
+
+实际使用时脚本会列出可用串口，默认使用 `COM9`，也可以手动输入其它串口。
+
+### 22.2 边界小窗复查机制
+
+边界复查针对的是另一类问题: 工作点真实最优值漂移到当前 anchor window 外侧，而普通三点梯度法被窗口边界挡住。
+
+触发逻辑可以概括为:
+
+```text
+I/Q 轴连续出现 anchor-clamp
++ 当前轴中心指标相对最好记录明显恶化
++ 不在 cooldown 中
+=> 对该轴执行边界小窗复查
+```
+
+复查动作:
+
+```text
+center = 当前被夹住的边界点
+range  = center +/- 0.15 V
+step   = 0.01 V
+选择该窗口内目标频点最小的点作为新 anchor
+```
+
+复查后动态调整 anchor window:
+
+```text
+new_window = max(default_window, |new_anchor - old_anchor| + margin)
+如果短时间内重复触发，则继续放大窗口
+稳定一段时间后，再逐步收缩窗口
+```
+
+这样做的原因是: 如果边界触发了复查，通常说明偏压漂移速度较快，原来的固定窗口已经太窄；复查后适当扩大窗口，可以避免刚更新完 anchor 又马上撞边界。
+
+### 22.3 实验 1: `2026-05-20_165318`
+
+对应数据:
+
+```text
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\simulation_image\lock_gradient\2026-05-20_165318_dpmzm_gradient_lock_steps.png
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-05-20_165318_dpmzm_gradient_lock_steps.csv
+```
+
+统计结论:
+
+| 项目 | 结果 |
+| --- | --- |
+| 总步数 | 1000 |
+| `still running` | 0 |
+| `debug snapshot` | 0 |
+| 边界小窗复查 | 0 |
+| DC guard 复查 | 0 |
+| PD DC 平均上升 | 约 `+0.72 dB` |
+
+这轮没有触发边界复查，说明在当前调制器和漂移速度下，三点梯度法本身基本能够维持住工作点。
+
+### 22.4 实验 2: `2026-05-20_172113`
+
+对应数据:
+
+```text
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\simulation_image\lock_gradient\2026-05-20_172113_dpmzm_gradient_lock_steps.png
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-05-20_172113_dpmzm_gradient_lock_steps.csv
+```
+
+统计结论:
+
+| 项目 | 结果 |
+| --- | --- |
+| 总步数 | 2000 |
+| `still running` | 0 |
+| `debug snapshot` | 0 |
+| 边界小窗复查 | 1 次 |
+| 复查轴 | I |
+| I anchor 更新 | `+5.090 V -> +4.860 V` |
+| I window 更新 | `0.200 V -> 0.330 V` |
+
+这轮证明了边界复查机制是有效的: I 轴被锚点窗口夹住后，指标持续恶化；脚本触发小窗复查，把 I anchor 往真实最优点方向移动，并扩大窗口，随后又逐步收缩。
+
+### 22.5 实验 3: `2026-05-20_213543`
+
+对应数据:
+
+```text
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\simulation_image\lock_gradient\2026-05-20_213543_dpmzm_gradient_lock_steps.png
+C:\Users\Administrator\Desktop\DPMZM_contral_bais\raw data\2026-05-20_213543_dpmzm_gradient_lock_steps.csv
+```
+
+统计结论:
+
+| 项目 | 结果 |
+| --- | --- |
+| 总步数 | 1000 |
+| `still running` | 0 |
+| `debug snapshot` | 0 |
+| 边界小窗复查 | 3 次 |
+| DC guard 复查 | 0 |
+| PD DC 平均上升 | 约 `+0.59 dB` |
+
+三次边界复查分别为:
+
+| 轴 | anchor 更新 | window 更新 | 说明 |
+| --- | --- | --- | --- |
+| I | `+5.550 V -> +5.330 V` | `0.200 V -> 0.320 V` | I 轴撞到低侧边界后重新定位 |
+| Q | `-4.090 V -> -3.870 V` | `0.200 V -> 0.320 V` | Q 轴撞到高侧边界后重新定位 |
+| I | `+5.330 V -> +5.110 V` | `0.210 V -> 0.320 V` | I 轴再次漂移后重新定位 |
+
+这一轮的关键意义是: 图中 I/Q 指标出现明显“掉下去又恢复”的段落，不是异常，而是边界复查机制在发挥作用。
+
+### 22.6 关于 `still running` 的当前判断
+
+更换 STLINK 后，长时间闭环测试中暂时没有再次观察到 `still running`。
+
+当前判断:
+
+```text
+此前 still running 很可能与旧 STLINK 的虚拟串口/USB 通信稳定性有关，
+不一定是固件状态机或算法本身卡死。
+```
+
+但仍保留自动 `dpmzm debug` 机制，因为它对后续排查仍然有价值。
+
+### 22.7 当前阶段结论
+
+当前 PC 侧闭环策略已经形成一个较完整的闭环结构:
+
+```text
+固件 auto coarse
+-> 固件 auto fine
+-> PC 侧 P -> I -> Q 三点梯度轮询
+-> 自适应步长
+-> PD DC 上升监测
+-> I/Q 边界小窗复查
+-> still running 自动 debug
+```
+
+目前最明确的结论:
+
+1. 三点梯度法仍是主控制器。
+2. PD DC guard 暂时更适合作为长期光功率恶化监测，不应替代频点指标。
+3. 边界小窗复查对 I/Q 慢漂移非常有帮助。
+4. 动态 anchor window 比固定窗口更合理，因为不同调制器、不同温漂速度下所需跟踪范围不同。
+5. 更换 STLINK 后，串口等待异常显著减少，后续测试应优先使用稳定下载器/虚拟串口。
+
+后续优先优化方向:
+
+1. 继续评估 PD DC 与光谱仪载波功率的对应关系。
+2. 将边界复查的触发阈值、窗口大小和 cooldown 做成更容易实验调整的参数。
+3. 如果 PC 侧策略持续稳定，再考虑把三点梯度 + 边界复查逐步固化到固件中。

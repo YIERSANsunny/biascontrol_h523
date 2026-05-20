@@ -16,6 +16,8 @@
 
 static float s_scan_block_ac[DSP_GOERTZEL_BLOCK_SIZE];
 static float s_scan_block_dc[DSP_GOERTZEL_BLOCK_SIZE];
+volatile dpmzm_scan_trace_t g_dpmzm_scan_trace;
+static dpmzm_scan_trace_error_t s_last_sample_error = DPMZM_SCAN_TRACE_ERR_NONE;
 
 typedef struct {
     float phase_rad;
@@ -60,6 +62,183 @@ static float tone_gen_next(dpmzm_tone_gen_t *gen)
         gen->phase_rad = fmodf(gen->phase_rad, 2.0f * M_PI);
     }
     return value;
+}
+
+const char *dpmzm_scan_trace_phase_name(dpmzm_scan_trace_phase_t phase)
+{
+    switch (phase) {
+    case DPMZM_SCAN_TRACE_IDLE:
+        return "idle";
+    case DPMZM_SCAN_TRACE_POINT_START:
+        return "point-start";
+    case DPMZM_SCAN_TRACE_APPLY_BIAS:
+        return "apply-bias";
+    case DPMZM_SCAN_TRACE_SETTLE:
+        return "settle";
+    case DPMZM_SCAN_TRACE_DISCARD:
+        return "discard";
+    case DPMZM_SCAN_TRACE_MEASURE:
+        return "measure";
+    case DPMZM_SCAN_TRACE_PROCESS:
+        return "process";
+    case DPMZM_SCAN_TRACE_FINALIZE:
+        return "finalize";
+    case DPMZM_SCAN_TRACE_RESTORE:
+        return "restore";
+    case DPMZM_SCAN_TRACE_DONE:
+        return "done";
+    case DPMZM_SCAN_TRACE_ERROR:
+        return "error";
+    default:
+        return "unknown";
+    }
+}
+
+const char *dpmzm_scan_trace_error_name(dpmzm_scan_trace_error_t error)
+{
+    switch (error) {
+    case DPMZM_SCAN_TRACE_ERR_NONE:
+        return "none";
+    case DPMZM_SCAN_TRACE_ERR_BAD_ARG:
+        return "bad-arg";
+    case DPMZM_SCAN_TRACE_ERR_BIAS_APPLY:
+        return "bias-apply";
+    case DPMZM_SCAN_TRACE_ERR_ADC_DRDY_TIMEOUT:
+        return "adc-drdy-timeout";
+    case DPMZM_SCAN_TRACE_ERR_ADC_READ:
+        return "adc-read";
+    case DPMZM_SCAN_TRACE_ERR_DISCARD:
+        return "discard";
+    case DPMZM_SCAN_TRACE_ERR_PILOT_BIAS_APPLY:
+        return "pilot-bias-apply";
+    case DPMZM_SCAN_TRACE_ERR_FINALIZE:
+        return "finalize";
+    case DPMZM_SCAN_TRACE_ERR_POINT_OVERFLOW:
+        return "point-overflow";
+    default:
+        return "unknown";
+    }
+}
+
+void dpmzm_scan_trace_snapshot(dpmzm_scan_trace_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+
+    out->generation = g_dpmzm_scan_trace.generation;
+    out->running = g_dpmzm_scan_trace.running;
+    out->phase = g_dpmzm_scan_trace.phase;
+    out->last_error = g_dpmzm_scan_trace.last_error;
+    out->stage = g_dpmzm_scan_trace.stage;
+    out->target = g_dpmzm_scan_trace.target;
+    out->pilot_mode = g_dpmzm_scan_trace.pilot_mode;
+    out->dump_mode = g_dpmzm_scan_trace.dump_mode;
+    out->sweep_v = g_dpmzm_scan_trace.sweep_v;
+    out->base_i_v = g_dpmzm_scan_trace.base_i_v;
+    out->base_q_v = g_dpmzm_scan_trace.base_q_v;
+    out->base_p_v = g_dpmzm_scan_trace.base_p_v;
+    out->sweep_index = g_dpmzm_scan_trace.sweep_index;
+    out->block_index = g_dpmzm_scan_trace.block_index;
+    out->sample_index = g_dpmzm_scan_trace.sample_index;
+    out->requested_blocks = g_dpmzm_scan_trace.requested_blocks;
+    out->samples_per_block = g_dpmzm_scan_trace.samples_per_block;
+    out->start_tick_ms = g_dpmzm_scan_trace.start_tick_ms;
+    out->phase_tick_ms = g_dpmzm_scan_trace.phase_tick_ms;
+    out->last_tick_ms = g_dpmzm_scan_trace.last_tick_ms;
+    out->success_count = g_dpmzm_scan_trace.success_count;
+    out->failure_count = g_dpmzm_scan_trace.failure_count;
+    out->bias_apply_fail_count = g_dpmzm_scan_trace.bias_apply_fail_count;
+    out->adc_drdy_timeout_count = g_dpmzm_scan_trace.adc_drdy_timeout_count;
+    out->adc_read_fail_count = g_dpmzm_scan_trace.adc_read_fail_count;
+    out->discard_fail_count = g_dpmzm_scan_trace.discard_fail_count;
+    out->pilot_bias_apply_fail_count = g_dpmzm_scan_trace.pilot_bias_apply_fail_count;
+    out->finalize_fail_count = g_dpmzm_scan_trace.finalize_fail_count;
+    out->point_overflow_fail_count = g_dpmzm_scan_trace.point_overflow_fail_count;
+}
+
+static void scan_trace_phase(dpmzm_scan_trace_phase_t phase)
+{
+    uint32_t now = HAL_GetTick();
+
+    g_dpmzm_scan_trace.phase = phase;
+    g_dpmzm_scan_trace.phase_tick_ms = now;
+    g_dpmzm_scan_trace.last_tick_ms = now;
+}
+
+static void scan_trace_begin_point(const dpmzm_scan_request_t *req,
+                                   float sweep_value,
+                                   float base_i_v,
+                                   float base_q_v,
+                                   float base_p_v)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (req == NULL) {
+        return;
+    }
+
+    g_dpmzm_scan_trace.generation++;
+    g_dpmzm_scan_trace.running = true;
+    g_dpmzm_scan_trace.phase = DPMZM_SCAN_TRACE_POINT_START;
+    g_dpmzm_scan_trace.last_error = DPMZM_SCAN_TRACE_ERR_NONE;
+    g_dpmzm_scan_trace.stage = req->stage;
+    g_dpmzm_scan_trace.target = req->target;
+    g_dpmzm_scan_trace.pilot_mode = req->pilot_mode;
+    g_dpmzm_scan_trace.dump_mode = req->dump_mode;
+    g_dpmzm_scan_trace.sweep_v = sweep_value;
+    g_dpmzm_scan_trace.base_i_v = base_i_v;
+    g_dpmzm_scan_trace.base_q_v = base_q_v;
+    g_dpmzm_scan_trace.base_p_v = base_p_v;
+    g_dpmzm_scan_trace.block_index = 0U;
+    g_dpmzm_scan_trace.sample_index = 0U;
+    g_dpmzm_scan_trace.requested_blocks = req->blocks;
+    g_dpmzm_scan_trace.samples_per_block = DSP_GOERTZEL_BLOCK_SIZE;
+    g_dpmzm_scan_trace.start_tick_ms = now;
+    g_dpmzm_scan_trace.phase_tick_ms = now;
+    g_dpmzm_scan_trace.last_tick_ms = now;
+}
+
+static void scan_trace_error(dpmzm_scan_trace_error_t error)
+{
+    g_dpmzm_scan_trace.last_error = error;
+    g_dpmzm_scan_trace.running = false;
+    g_dpmzm_scan_trace.failure_count++;
+
+    switch (error) {
+    case DPMZM_SCAN_TRACE_ERR_BIAS_APPLY:
+        g_dpmzm_scan_trace.bias_apply_fail_count++;
+        break;
+    case DPMZM_SCAN_TRACE_ERR_ADC_DRDY_TIMEOUT:
+        g_dpmzm_scan_trace.adc_drdy_timeout_count++;
+        break;
+    case DPMZM_SCAN_TRACE_ERR_ADC_READ:
+        g_dpmzm_scan_trace.adc_read_fail_count++;
+        break;
+    case DPMZM_SCAN_TRACE_ERR_DISCARD:
+        g_dpmzm_scan_trace.discard_fail_count++;
+        break;
+    case DPMZM_SCAN_TRACE_ERR_PILOT_BIAS_APPLY:
+        g_dpmzm_scan_trace.pilot_bias_apply_fail_count++;
+        break;
+    case DPMZM_SCAN_TRACE_ERR_FINALIZE:
+        g_dpmzm_scan_trace.finalize_fail_count++;
+        break;
+    case DPMZM_SCAN_TRACE_ERR_POINT_OVERFLOW:
+        g_dpmzm_scan_trace.point_overflow_fail_count++;
+        break;
+    default:
+        break;
+    }
+
+    scan_trace_phase(DPMZM_SCAN_TRACE_ERROR);
+}
+
+static void scan_trace_success(void)
+{
+    g_dpmzm_scan_trace.success_count++;
+    g_dpmzm_scan_trace.running = false;
+    scan_trace_phase(DPMZM_SCAN_TRACE_DONE);
 }
 
 const char *dpmzm_scan_stage_name(dpmzm_scan_stage_t stage)
@@ -184,18 +363,22 @@ static bool wait_and_read_sample(float *sample_ac_v, float *sample_dc_v)
     ads131m02_sample_t sample;
     uint32_t t0;
 
+    s_last_sample_error = DPMZM_SCAN_TRACE_ERR_NONE;
     if (sample_ac_v == NULL || sample_dc_v == NULL) {
+        s_last_sample_error = DPMZM_SCAN_TRACE_ERR_BAD_ARG;
         return false;
     }
 
     t0 = HAL_GetTick();
     while (board_adc_drdy_read() != 0U) {
         if ((HAL_GetTick() - t0) > DPMZM_SCAN_DRDY_TIMEOUT_MS) {
+            s_last_sample_error = DPMZM_SCAN_TRACE_ERR_ADC_DRDY_TIMEOUT;
             return false;
         }
     }
 
     if (ads131m02_read_sample(&sample) != 0 || !sample.valid) {
+        s_last_sample_error = DPMZM_SCAN_TRACE_ERR_ADC_READ;
         return false;
     }
 
@@ -212,6 +395,7 @@ static bool discard_settle_samples(uint32_t sample_count)
         float sample_ac_v = 0.0f;
         float sample_dc_v = 0.0f;
 
+        g_dpmzm_scan_trace.sample_index = i;
         if (!wait_and_read_sample(&sample_ac_v, &sample_dc_v)) {
             return false;
         }
@@ -346,11 +530,15 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
     uint32_t b;
 
     if (req == NULL || out == NULL) {
+        scan_trace_error(DPMZM_SCAN_TRACE_ERR_BAD_ARG);
         return false;
     }
 
     point_base_biases(req, sweep_value, &base_vi, &base_vq, &base_vp);
+    scan_trace_begin_point(req, sweep_value, base_vi, base_vq, base_vp);
+    scan_trace_phase(DPMZM_SCAN_TRACE_APPLY_BIAS);
     if (apply_scan_biases(req, base_vi, base_vq, base_vp) != 0) {
+        scan_trace_error(DPMZM_SCAN_TRACE_ERR_BIAS_APPLY);
         printf("[dpmzm][scan] ERROR: bias apply failed at %s-%s sweep=%+.3fV\r\n",
                dpmzm_scan_stage_name(req->stage),
                dpmzm_scan_target_name(req->target),
@@ -358,14 +546,19 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
         return false;
     }
 
+    scan_trace_phase(DPMZM_SCAN_TRACE_SETTLE);
     board_delay_ms(req->settle_ms);
     /*
      * The first coherent block after a bias step can contain DAC/analog/ADC
      * settling residue. Drop it so each reported scan point is computed from
      * steady-state samples only.
      */
+    scan_trace_phase(DPMZM_SCAN_TRACE_DISCARD);
     if (!discard_settle_samples(DSP_GOERTZEL_BLOCK_SIZE *
                                 DPMZM_SCAN_DISCARD_BLOCKS_AFTER_SETTLE)) {
+        scan_trace_error(s_last_sample_error == DPMZM_SCAN_TRACE_ERR_NONE ?
+                         DPMZM_SCAN_TRACE_ERR_DISCARD :
+                         s_last_sample_error);
         printf("[dpmzm][scan] ERROR: ADC discard failed at %s-%s sweep=%+.3fV\r\n",
                dpmzm_scan_stage_name(req->stage),
                dpmzm_scan_target_name(req->target),
@@ -394,6 +587,8 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
     for (b = 0; b < req->blocks; b++) {
         uint32_t s;
 
+        g_dpmzm_scan_trace.block_index = b;
+        g_dpmzm_scan_trace.sample_index = 0U;
         dpmzm_measure_reset(&measure_ctx);
         if (req->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD &&
             !req->continuous_onboard_pilot) {
@@ -401,10 +596,13 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
             tone_gen_reset(&tone_q);
         }
 
+        scan_trace_phase(DPMZM_SCAN_TRACE_MEASURE);
         for (s = 0; s < DSP_GOERTZEL_BLOCK_SIZE; s++) {
             float sample_ac_v = 0.0f;
             float sample_dc_v = 0.0f;
 
+            g_dpmzm_scan_trace.block_index = b;
+            g_dpmzm_scan_trace.sample_index = s;
             /*
              * Onboard-pilot scans now prefer the continuously running TIM6
              * generator prepared by app_dpmzm_scan_begin(). This avoids
@@ -422,6 +620,7 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
                 drive_vq += tone_gen_next(&tone_q);
 
                 if (apply_scan_biases(req, drive_vi, drive_vq, base_vp) != 0) {
+                    scan_trace_error(DPMZM_SCAN_TRACE_ERR_PILOT_BIAS_APPLY);
                     printf("[dpmzm][scan] ERROR: pilot bias apply failed at %s-%s sweep=%+.3fV block=%lu sample=%lu\r\n",
                            dpmzm_scan_stage_name(req->stage),
                            dpmzm_scan_target_name(req->target),
@@ -433,6 +632,9 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
             }
 
             if (!wait_and_read_sample(&sample_ac_v, &sample_dc_v)) {
+                scan_trace_error(s_last_sample_error == DPMZM_SCAN_TRACE_ERR_NONE ?
+                                 DPMZM_SCAN_TRACE_ERR_ADC_READ :
+                                 s_last_sample_error);
                 printf("[dpmzm][scan] ERROR: ADC read failed at %s-%s sweep=%+.3fV block=%lu sample=%lu\r\n",
                        dpmzm_scan_stage_name(req->stage),
                        dpmzm_scan_target_name(req->target),
@@ -446,6 +648,7 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
             s_scan_block_dc[s] = sample_dc_v;
         }
 
+        scan_trace_phase(DPMZM_SCAN_TRACE_PROCESS);
         for (s = 0; s < DSP_GOERTZEL_BLOCK_SIZE; s++) {
             if (req->dump_mode == DPMZM_SCAN_DUMP_RAW ||
                 req->dump_mode == DPMZM_SCAN_DUMP_BOTH) {
@@ -464,7 +667,9 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
                                          s_scan_block_dc[s]);
         }
 
+        scan_trace_phase(DPMZM_SCAN_TRACE_FINALIZE);
         if (!dpmzm_measure_finalize(&measure_ctx, &block_result)) {
+            scan_trace_error(DPMZM_SCAN_TRACE_ERR_FINALIZE);
             printf("[dpmzm][scan] ERROR: measure finalize failed at %s-%s sweep=%+.3fV block=%lu\r\n",
                    dpmzm_scan_stage_name(req->stage),
                    dpmzm_scan_target_name(req->target),
@@ -487,7 +692,9 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
     out->dc_mean = sum_dc / (float)req->blocks;
     out->sample_count = req->blocks * DSP_GOERTZEL_BLOCK_SIZE;
 
+    scan_trace_phase(DPMZM_SCAN_TRACE_RESTORE);
     (void)apply_scan_biases(req, base_vi, base_vq, base_vp);
+    scan_trace_success();
     return true;
 }
 
@@ -535,6 +742,7 @@ bool dpmzm_scan_run_collect(const dpmzm_scan_request_t *req,
         float base_vp = 0.0f;
         float primary;
 
+        g_dpmzm_scan_trace.sweep_index = point_count;
         if (!dpmzm_scan_measure_point(req, sweep, &m)) {
             return false;
         }
@@ -546,6 +754,7 @@ bool dpmzm_scan_run_collect(const dpmzm_scan_request_t *req,
         }
         if (points != NULL) {
             if (point_count >= point_capacity) {
+                scan_trace_error(DPMZM_SCAN_TRACE_ERR_POINT_OVERFLOW);
                 return false;
             }
             points[point_count].sweep_v = sweep;

@@ -79,9 +79,72 @@ typedef struct {
     float dc_mean;
 } dpmzm_scan_point_t;
 
+typedef enum {
+    DPMZM_SCAN_TRACE_IDLE = 0,
+    DPMZM_SCAN_TRACE_POINT_START,
+    DPMZM_SCAN_TRACE_APPLY_BIAS,
+    DPMZM_SCAN_TRACE_SETTLE,
+    DPMZM_SCAN_TRACE_DISCARD,
+    DPMZM_SCAN_TRACE_MEASURE,
+    DPMZM_SCAN_TRACE_PROCESS,
+    DPMZM_SCAN_TRACE_FINALIZE,
+    DPMZM_SCAN_TRACE_RESTORE,
+    DPMZM_SCAN_TRACE_DONE,
+    DPMZM_SCAN_TRACE_ERROR
+} dpmzm_scan_trace_phase_t;
+
+typedef enum {
+    DPMZM_SCAN_TRACE_ERR_NONE = 0,
+    DPMZM_SCAN_TRACE_ERR_BAD_ARG,
+    DPMZM_SCAN_TRACE_ERR_BIAS_APPLY,
+    DPMZM_SCAN_TRACE_ERR_ADC_DRDY_TIMEOUT,
+    DPMZM_SCAN_TRACE_ERR_ADC_READ,
+    DPMZM_SCAN_TRACE_ERR_DISCARD,
+    DPMZM_SCAN_TRACE_ERR_PILOT_BIAS_APPLY,
+    DPMZM_SCAN_TRACE_ERR_FINALIZE,
+    DPMZM_SCAN_TRACE_ERR_POINT_OVERFLOW
+} dpmzm_scan_trace_error_t;
+
+typedef struct {
+    volatile uint32_t generation;
+    volatile bool running;
+    volatile dpmzm_scan_trace_phase_t phase;
+    volatile dpmzm_scan_trace_error_t last_error;
+    volatile dpmzm_scan_stage_t stage;
+    volatile dpmzm_scan_target_t target;
+    volatile dpmzm_scan_pilot_mode_t pilot_mode;
+    volatile dpmzm_scan_dump_mode_t dump_mode;
+    volatile float sweep_v;
+    volatile float base_i_v;
+    volatile float base_q_v;
+    volatile float base_p_v;
+    volatile uint32_t sweep_index;
+    volatile uint32_t block_index;
+    volatile uint32_t sample_index;
+    volatile uint32_t requested_blocks;
+    volatile uint32_t samples_per_block;
+    volatile uint32_t start_tick_ms;
+    volatile uint32_t phase_tick_ms;
+    volatile uint32_t last_tick_ms;
+    volatile uint32_t success_count;
+    volatile uint32_t failure_count;
+    volatile uint32_t bias_apply_fail_count;
+    volatile uint32_t adc_drdy_timeout_count;
+    volatile uint32_t adc_read_fail_count;
+    volatile uint32_t discard_fail_count;
+    volatile uint32_t pilot_bias_apply_fail_count;
+    volatile uint32_t finalize_fail_count;
+    volatile uint32_t point_overflow_fail_count;
+} dpmzm_scan_trace_t;
+
+extern volatile dpmzm_scan_trace_t g_dpmzm_scan_trace;
+
 const char *dpmzm_scan_stage_name(dpmzm_scan_stage_t stage);
 const char *dpmzm_scan_target_name(dpmzm_scan_target_t target);
 const char *dpmzm_scan_pilot_mode_name(dpmzm_scan_pilot_mode_t mode);
+const char *dpmzm_scan_trace_phase_name(dpmzm_scan_trace_phase_t phase);
+const char *dpmzm_scan_trace_error_name(dpmzm_scan_trace_error_t error);
+void dpmzm_scan_trace_snapshot(dpmzm_scan_trace_t *out);
 
 bool dpmzm_scan_run(const dpmzm_scan_request_t *req,
                     dpmzm_scan_summary_t *summary_out);

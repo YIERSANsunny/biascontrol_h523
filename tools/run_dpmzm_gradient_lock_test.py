@@ -96,6 +96,18 @@ class DcGuardState:
     rise_history_db: list[float] | None = None
 
 
+@dataclass
+class BoundaryRecheckState:
+    best_objective: float | None = None
+    best_dbm: float | None = None
+    best_bias_v: float | None = None
+    window_v: float | None = None
+    clamp_streak: int = 0
+    stable_steps: int = 0
+    cooldown_steps: int = 0
+    last_recheck_step: int | None = None
+
+
 def metric_to_dbm(vpeak: float) -> float:
     vrms = max(vpeak, 0.0) * 0.70710678
     mw = ((vrms * vrms) / 50.0) * 1000.0
@@ -214,6 +226,12 @@ def update_adaptive_state(
             state.scale = min(args.adaptive_max_scale, state.scale * args.adaptive_growth)
 
     state.last_direction = direction
+
+
+def boundary_window(state: BoundaryRecheckState, args: argparse.Namespace) -> float:
+    if state.window_v is None:
+        state.window_v = args.iq_anchor_window
+    return state.window_v
 
 
 def dc_rise_db(dc_now: float, dc_anchor: float, dc_floor: float) -> float:
@@ -351,12 +369,14 @@ def run_gradient_step(
     adaptive_state: AxisAdaptiveState,
     dc_guard_state: DcGuardState,
     args: argparse.Namespace,
+    anchor_window_v: float | None = None,
 ) -> tuple[BiasPoint, GradientRecord, bool]:
     config = axis_config(axis, args.iq_blocks, args.p_blocks, args.iq_anchor_window, args.p_anchor_window)
+    active_anchor_window_v = config.anchor_window_v if anchor_window_v is None else anchor_window_v
     center_v = axis_value(bias, axis)
     anchor_v = axis_value(anchor, axis)
-    min_v = max(args.min_bias, anchor_v - config.anchor_window_v)
-    max_v = min(args.max_bias, anchor_v + config.anchor_window_v)
+    min_v = max(args.min_bias, anchor_v - active_anchor_window_v)
+    max_v = min(args.max_bias, anchor_v + active_anchor_window_v)
     center_v = clamp(center_v, min_v, max_v)
 
     v_minus = clamp(center_v - args.delta, min_v, max_v)
@@ -410,6 +430,7 @@ def run_gradient_step(
         f"dc={row_center.dc:+.6f}V rise={pd_dc_rise:+.2f}dB avg={pd_dc_rise_avg:+.2f}dB "
         f"guard={dc_guard_event}/{pd_dc_count} "
         f"gain={gain:.4f}V max={max_step:.4f}V scale={scale_used:.2f}->{adaptive_state.scale:.2f} "
+        f"anchor_win={active_anchor_window_v:.4f}V "
         f"step={applied_step:+.5f}V -> {new_v:+.4f}V {reason}"
     )
 
@@ -468,6 +489,136 @@ def choose_recheck_row(rows: list[MetricRow], dc_limit_abs: float, args: argpars
     valid_rows = [row for row in rows if abs(row.dc) <= dc_limit_abs]
     candidates = valid_rows if valid_rows else rows
     return min(candidates, key=lambda row: objective_from_metric(metric_value(row), args.use_power))
+
+
+def update_boundary_recheck_state(
+    state: BoundaryRecheckState,
+    record: GradientRecord,
+    args: argparse.Namespace,
+) -> tuple[bool, str | None]:
+    if record.axis not in {"i", "q"}:
+        return False, None
+
+    boundary_window(state, args)
+    shrink_message: str | None = None
+
+    if state.cooldown_steps > 0:
+        state.cooldown_steps -= 1
+
+    if state.best_objective is None or record.objective_center < state.best_objective:
+        state.best_objective = record.objective_center
+        state.best_dbm = record.dbm_center
+        state.best_bias_v = record.v_center
+
+    if "+anchor-clamp" in record.reason:
+        state.clamp_streak += 1
+        state.stable_steps = 0
+    else:
+        state.clamp_streak = 0
+        if args.boundary_recheck and state.window_v is not None and state.window_v > args.iq_anchor_window:
+            state.stable_steps += 1
+            if (
+                args.boundary_recheck_shrink_stable_steps > 0
+                and state.stable_steps >= args.boundary_recheck_shrink_stable_steps
+            ):
+                old_window = state.window_v
+                state.window_v = max(args.iq_anchor_window, state.window_v * args.boundary_recheck_shrink)
+                state.stable_steps = 0
+                if state.window_v < old_window - 1e-9:
+                    shrink_message = (
+                        f"boundary window shrink axis={record.axis}: "
+                        f"{old_window:.4f}V -> {state.window_v:.4f}V"
+                    )
+
+    if not args.boundary_recheck:
+        return False, shrink_message
+    if state.cooldown_steps > 0:
+        return False, shrink_message
+    if state.best_dbm is None:
+        return False, shrink_message
+
+    # dBm is minimized, so a less-negative current dBm means the axis is worse.
+    degrade_db = record.dbm_center - state.best_dbm
+    trigger = (
+        state.clamp_streak >= args.boundary_recheck_count
+        and degrade_db >= args.boundary_recheck_degrade_db
+    )
+    return trigger, shrink_message
+
+
+def run_boundary_recheck(
+    session: SerialSession,
+    bias: BiasPoint,
+    anchor: BiasPoint,
+    axis: str,
+    state: BoundaryRecheckState,
+    step_index: int,
+    args: argparse.Namespace,
+) -> tuple[BiasPoint, BiasPoint]:
+    config = axis_config(axis, args.iq_blocks, args.p_blocks, args.iq_anchor_window, args.p_anchor_window)
+    center_v = axis_value(bias, axis)
+    values = local_sweep_values(
+        center_v,
+        args.boundary_recheck_window,
+        args.boundary_recheck_step,
+        args.min_bias,
+        args.max_bias,
+    )
+
+    session.progress(
+        f"boundary recheck start axis={axis}: center={center_v:+.4f}V "
+        f"window=+/-{args.boundary_recheck_window:.4f}V step={args.boundary_recheck_step:.4f}V "
+        f"points={len(values)}"
+    )
+
+    rows: list[MetricRow] = []
+    for index, value in enumerate(values, start=1):
+        row = measure_single_point(
+            session,
+            config,
+            value,
+            f"boundary {axis} {index:02d}/{len(values):02d}",
+            args.point_timeout,
+        )
+        rows.append(row)
+
+    selected = min(rows, key=lambda row: objective_from_metric(metric_value(row), args.use_power))
+    selected_metric = metric_value(selected)
+    selected_obj = objective_from_metric(selected_metric, args.use_power)
+    selected_dbm = metric_to_dbm(selected_metric)
+    old_anchor_v = axis_value(anchor, axis)
+    old_window = boundary_window(state, args)
+
+    apply_bias(session, axis, selected.sweep, wait_s=0.25)
+    bias = set_axis_value(bias, axis, selected.sweep)
+    anchor = set_axis_value(anchor, axis, selected.sweep)
+
+    shift_v = abs(selected.sweep - old_anchor_v)
+    new_window = max(args.iq_anchor_window, shift_v + args.boundary_recheck_expand_margin)
+    if (
+        state.last_recheck_step is not None
+        and step_index - state.last_recheck_step <= args.boundary_recheck_fast_repeat_steps
+    ):
+        new_window = max(new_window, old_window * args.boundary_recheck_fast_expand)
+    new_window = min(new_window, args.boundary_recheck_max_window)
+
+    state.best_objective = selected_obj
+    state.best_dbm = selected_dbm
+    state.best_bias_v = selected.sweep
+    state.window_v = new_window
+    state.clamp_streak = 0
+    state.stable_steps = 0
+    state.cooldown_steps = args.boundary_recheck_cooldown_steps
+    state.last_recheck_step = step_index
+
+    session.progress(
+        f"boundary recheck axis={axis}: anchor {old_anchor_v:+.4f}V -> {selected.sweep:+.4f}V "
+        f"metric={selected_dbm:+.2f}dBm dc={selected.dc:+.6f}V "
+        f"window={old_window:.4f}V -> {new_window:.4f}V "
+        f"cooldown={state.cooldown_steps}"
+    )
+
+    return bias, anchor
 
 
 def run_dc_guard_recheck(
@@ -705,6 +856,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dc-recheck-p-window", type=float, default=0.10, help="P local recheck half-window in volts.")
     parser.add_argument("--dc-recheck-step", type=float, default=0.01, help="Local recheck step in volts.")
     parser.add_argument("--dc-guard-update-anchor", action="store_true", help="Allow PD DC anchor to update after a successful recheck.")
+    parser.add_argument("--boundary-recheck", action="store_true", help="Recenter I/Q anchors when repeated anchor clamps cause metric degradation.")
+    parser.add_argument("--boundary-recheck-degrade-db", type=float, default=8.0, help="Trigger I/Q boundary recheck after this center-metric degradation from best dBm.")
+    parser.add_argument("--boundary-recheck-count", type=int, default=3, help="Repeated I/Q anchor clamps required before boundary recheck.")
+    parser.add_argument("--boundary-recheck-window", type=float, default=0.15, help="I/Q boundary local recheck half-window in volts.")
+    parser.add_argument("--boundary-recheck-step", type=float, default=0.01, help="I/Q boundary local recheck step in volts.")
+    parser.add_argument("--boundary-recheck-cooldown-steps", type=int, default=12, help="Gradient steps to wait after one boundary recheck.")
+    parser.add_argument("--boundary-recheck-expand-margin", type=float, default=0.10, help="Extra I/Q anchor-window margin after a boundary recheck in volts.")
+    parser.add_argument("--boundary-recheck-fast-repeat-steps", type=int, default=30, help="Treat another boundary recheck within this many gradient steps as fast drift.")
+    parser.add_argument("--boundary-recheck-fast-expand", type=float, default=1.5, help="Multiply I/Q anchor window by this factor after fast repeated boundary rechecks.")
+    parser.add_argument("--boundary-recheck-max-window", type=float, default=0.80, help="Maximum dynamic I/Q anchor window in volts.")
+    parser.add_argument("--boundary-recheck-shrink-stable-steps", type=int, default=50, help="Stable non-clamped I/Q gradient steps before shrinking the dynamic window.")
+    parser.add_argument("--boundary-recheck-shrink", type=float, default=0.90, help="Dynamic I/Q anchor-window shrink factor after stable operation.")
     parser.add_argument("--deadband", type=float, default=0.03, help="Normalized gradient deadband.")
     parser.add_argument("--iq-blocks", type=int, default=4)
     parser.add_argument("--p-blocks", type=int, default=10)
@@ -746,6 +909,7 @@ def main() -> int:
 
     records: list[GradientRecord] = []
     adaptive_states = {axis: AxisAdaptiveState() for axis in ("p", "i", "q")}
+    boundary_recheck_states = {axis: BoundaryRecheckState() for axis in ("i", "q")}
     dc_guard_state = DcGuardState()
     exit_code = 0
 
@@ -789,11 +953,16 @@ def main() -> int:
                 f"gain I/Q/P={axis_gain(args, 'i'):.4f}/{axis_gain(args, 'q'):.4f}/{axis_gain(args, 'p'):.4f}V "
                 f"max_step I/Q/P={axis_max_step(args, 'i'):.4f}/{axis_max_step(args, 'q'):.4f}/{axis_max_step(args, 'p'):.4f}V "
                 f"adaptive={'on' if args.adaptive_step else 'off'} hard_max={args.adaptive_hard_max_step:.4f}V "
-                f"dc_guard={'on' if args.dc_guard else 'off'} threshold={args.dc_guard_threshold_db:.1f}dB"
+                f"dc_guard={'on' if args.dc_guard else 'off'} threshold={args.dc_guard_threshold_db:.1f}dB "
+                f"boundary_recheck={'on' if args.boundary_recheck else 'off'} "
+                f"degrade={args.boundary_recheck_degrade_db:.1f}dB count={args.boundary_recheck_count} "
+                f"dynamic_window min={args.iq_anchor_window:.3f}V max={args.boundary_recheck_max_window:.3f}V"
             )
 
             for step_index in range(1, args.cycles + 1):
                 axis = axes[(step_index - 1) % len(axes)]
+                boundary_state = boundary_recheck_states.get(axis)
+                active_anchor_window = boundary_window(boundary_state, args) if boundary_state is not None else None
                 bias, record, dc_guard_trigger = run_gradient_step(
                     session,
                     step_index,
@@ -803,8 +972,25 @@ def main() -> int:
                     adaptive_states[axis],
                     dc_guard_state,
                     args,
+                    active_anchor_window,
                 )
                 records.append(record)
+                if boundary_state is not None:
+                    boundary_trigger, shrink_message = update_boundary_recheck_state(boundary_state, record, args)
+                    if shrink_message:
+                        session.progress(shrink_message)
+                    if boundary_trigger:
+                        record.dc_guard_event = "boundary-recheck"
+                        record.reason += "+boundary-recheck"
+                        bias, anchor = run_boundary_recheck(
+                            session,
+                            bias,
+                            anchor,
+                            axis,
+                            boundary_state,
+                            step_index,
+                            args,
+                        )
                 if dc_guard_trigger:
                     record.dc_guard_event = "trigger-recheck"
                     record.reason += "+dc-guard-recheck"

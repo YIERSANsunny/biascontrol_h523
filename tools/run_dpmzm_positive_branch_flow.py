@@ -165,6 +165,14 @@ class SerialSession:
         self.ser.write((command + "\r\n").encode("ascii", errors="ignore"))
         self.ser.flush()
 
+    def request_debug_snapshot(self, label: str) -> None:
+        self.progress(f"{label}: still-running debug snapshot")
+        try:
+            self.send("dpmzm debug")
+            self.read_for(0.8)
+        except serial.SerialException as exc:
+            self.progress(f"{label}: debug snapshot failed: {exc}")
+
     def wait_for_any(self, needles: list[str], timeout_s: float, label: str) -> str | None:
         start = time.time()
         seen = len(self.lines)
@@ -180,6 +188,7 @@ class SerialSession:
             now = time.time()
             if now - last_progress >= 20.0:
                 self.progress(f"{label} still running, elapsed {now - start:.0f}s")
+                self.request_debug_snapshot(label)
                 last_progress = now
         self.progress(f"{label} timeout after {timeout_s:.0f}s")
         return None
@@ -213,6 +222,7 @@ class SerialSession:
             now = time.time()
             if now - last_progress >= 20.0:
                 self.progress(f"{label} still running, elapsed {now - start:.0f}s")
+                self.request_debug_snapshot(label)
                 last_progress = now
         raise TimeoutError(f"{label} timeout")
 
