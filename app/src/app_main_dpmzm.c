@@ -38,6 +38,8 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_LOCK_DEFAULT_DELTA_V      0.01f
 #define DPMZM_LOCK_DEFAULT_GAIN_V       0.003f
 #define DPMZM_LOCK_DEFAULT_MAX_STEP_V   0.003f
+#define DPMZM_LOCK_DEFAULT_Q_GAIN_V     0.003f
+#define DPMZM_LOCK_DEFAULT_Q_MAX_STEP_V 0.003f
 #define DPMZM_LOCK_DEFAULT_DEADBAND     0.03f
 #define DPMZM_LOCK_DEFAULT_SETTLE_MS    10U
 #define DPMZM_LOCK_DEFAULT_IQ_BLOCKS    4U
@@ -45,6 +47,33 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_LOCK_DEFAULT_IQ_WINDOW_V  0.20f
 #define DPMZM_LOCK_DEFAULT_P_WINDOW_V   0.30f
 #define DPMZM_LOCK_DEFAULT_INTERVAL_MS  500U
+#define DPMZM_LOCK_ADAPTIVE_HARD_MAX_STEP_V 0.010f
+#define DPMZM_LOCK_ADAPTIVE_MIN_SCALE       0.50f
+#define DPMZM_LOCK_ADAPTIVE_MAX_SCALE       4.00f
+#define DPMZM_LOCK_ADAPTIVE_GROWTH          1.50f
+#define DPMZM_LOCK_ADAPTIVE_SHRINK          0.50f
+#define DPMZM_LOCK_ADAPTIVE_SAME_DIR_COUNT  3U
+#define DPMZM_LOCK_BOUNDARY_DEGRADE_DB      8.0f
+#define DPMZM_LOCK_BOUNDARY_COUNT           3U
+#define DPMZM_LOCK_BOUNDARY_WINDOW_V        0.15f
+#define DPMZM_LOCK_BOUNDARY_STEP_V          0.01f
+#define DPMZM_LOCK_BOUNDARY_COOLDOWN_STEPS  12
+#define DPMZM_LOCK_BOUNDARY_EXPAND_MARGIN_V 0.10f
+#define DPMZM_LOCK_BOUNDARY_FAST_REPEAT     30U
+#define DPMZM_LOCK_BOUNDARY_FAST_EXPAND     1.50f
+#define DPMZM_LOCK_BOUNDARY_MAX_WINDOW_V    0.80f
+#define DPMZM_LOCK_BOUNDARY_SHRINK_STABLE   50U
+#define DPMZM_LOCK_BOUNDARY_SHRINK          0.90f
+#define DPMZM_LOCK_DC_GUARD_THRESHOLD_DB    4.0f
+#define DPMZM_LOCK_DC_GUARD_RELEASE_DB      2.0f
+#define DPMZM_LOCK_DC_GUARD_AVG_WINDOW      5U
+#define DPMZM_LOCK_DC_GUARD_COUNT           3U
+#define DPMZM_LOCK_DC_GUARD_COOLDOWN_STEPS  12
+#define DPMZM_LOCK_DC_GUARD_FLOOR_V         1.0e-5f
+#define DPMZM_LOCK_DC_RECHECK_IQ_WINDOW_V   0.08f
+#define DPMZM_LOCK_DC_RECHECK_P_WINDOW_V    0.10f
+#define DPMZM_LOCK_DC_RECHECK_STEP_V        0.01f
+#define DPMZM_LOCK_DBM_FLOOR_MW             1.0e-15f
 
 /*
  * The pilot phase accumulator must use TIM6's actual update rate. A hardcoded
@@ -79,7 +108,257 @@ typedef struct {
     int32_t ch1_code;
 } dpmzm_capture_sample_t;
 
+typedef struct {
+    float scale;
+    int8_t last_direction;
+    uint8_t same_direction_count;
+} dpmzm_lock_adaptive_axis_t;
+
+typedef struct {
+    bool valid;
+    float best_objective;
+    float best_dbm;
+    float best_bias_v;
+    float window_v;
+    uint8_t clamp_streak;
+    uint16_t stable_steps;
+    int32_t cooldown_steps;
+    uint32_t last_recheck_step;
+} dpmzm_lock_boundary_axis_t;
+
+typedef struct {
+    bool anchor_valid;
+    bool armed;
+    float anchor_dc_v;
+    float rise_history_db[DPMZM_LOCK_DC_GUARD_AVG_WINDOW];
+    uint8_t history_count;
+    uint8_t history_index;
+    uint8_t trigger_count;
+    int32_t cooldown_steps;
+} dpmzm_lock_dc_guard_t;
+
+typedef struct {
+    bool valid;
+    float sweep_v;
+    float metric;
+    float objective;
+    float dbm;
+    float dc_v;
+} dpmzm_lock_local_measurement_t;
+
 static dpmzm_capture_sample_t s_capture_samples[DPMZM_CAPTURE_SAMPLES_MAX];
+static dpmzm_lock_adaptive_axis_t s_lock_adaptive[DPMZM_LOCK_AXIS_COUNT];
+static dpmzm_lock_boundary_axis_t s_lock_boundary[DPMZM_LOCK_AXIS_COUNT];
+static dpmzm_lock_dc_guard_t s_lock_dc_guard;
+
+static float app_clampf(float value, float min_v, float max_v)
+{
+    if (value < min_v) {
+        return min_v;
+    }
+    if (value > max_v) {
+        return max_v;
+    }
+    return value;
+}
+
+static float app_metric_to_dbm(float vpeak)
+{
+    const float vrms = fmaxf(vpeak, 0.0f) * 0.70710678f;
+    float power_mw = ((vrms * vrms) / 50.0f) * 1000.0f;
+
+    if (power_mw < DPMZM_LOCK_DBM_FLOOR_MW) {
+        power_mw = DPMZM_LOCK_DBM_FLOOR_MW;
+    }
+    return 10.0f * log10f(power_mw);
+}
+
+static float app_objective_from_metric(float metric)
+{
+    metric = fmaxf(metric, 0.0f);
+    return metric * metric;
+}
+
+static int8_t app_step_direction(float step_v)
+{
+    if (step_v > 1.0e-9f) {
+        return 1;
+    }
+    if (step_v < -1.0e-9f) {
+        return -1;
+    }
+    return 0;
+}
+
+static float lock_axis_base_gain(dpmzm_lock_axis_t axis)
+{
+    if (axis == DPMZM_LOCK_AXIS_Q) {
+        return DPMZM_LOCK_DEFAULT_Q_GAIN_V;
+    }
+    return DPMZM_LOCK_DEFAULT_GAIN_V;
+}
+
+static float lock_axis_base_max_step(dpmzm_lock_axis_t axis)
+{
+    if (axis == DPMZM_LOCK_AXIS_Q) {
+        return DPMZM_LOCK_DEFAULT_Q_MAX_STEP_V;
+    }
+    return DPMZM_LOCK_DEFAULT_MAX_STEP_V;
+}
+
+static void reset_lock_runtime_state(void)
+{
+    for (uint32_t i = 0U; i < (uint32_t)DPMZM_LOCK_AXIS_COUNT; i++) {
+        s_lock_adaptive[i].scale = 1.0f;
+        s_lock_adaptive[i].last_direction = 0;
+        s_lock_adaptive[i].same_direction_count = 0U;
+
+        memset(&s_lock_boundary[i], 0, sizeof(s_lock_boundary[i]));
+        s_lock_boundary[i].window_v = DPMZM_LOCK_DEFAULT_IQ_WINDOW_V;
+    }
+    memset(&s_lock_dc_guard, 0, sizeof(s_lock_dc_guard));
+}
+
+static float lock_axis_dynamic_window(dpmzm_lock_axis_t axis)
+{
+    if (axis == DPMZM_LOCK_AXIS_P) {
+        return DPMZM_LOCK_DEFAULT_P_WINDOW_V;
+    }
+    if (axis < DPMZM_LOCK_AXIS_COUNT && s_lock_boundary[axis].window_v > 0.0f) {
+        return s_lock_boundary[axis].window_v;
+    }
+    return DPMZM_LOCK_DEFAULT_IQ_WINDOW_V;
+}
+
+static void update_lock_adaptive_state(dpmzm_lock_axis_t axis,
+                                       float applied_step_v,
+                                       bool held,
+                                       bool clamped)
+{
+    dpmzm_lock_adaptive_axis_t *state;
+    int8_t direction;
+
+    if (axis >= DPMZM_LOCK_AXIS_COUNT) {
+        return;
+    }
+
+    state = &s_lock_adaptive[axis];
+    direction = app_step_direction(applied_step_v);
+
+    if (direction == 0 || held || clamped) {
+        state->same_direction_count = 0U;
+        if (state->scale > 1.0f) {
+            state->scale = fmaxf(1.0f, state->scale * DPMZM_LOCK_ADAPTIVE_SHRINK);
+        }
+        return;
+    }
+
+    if (state->last_direction != 0 && direction != state->last_direction) {
+        state->same_direction_count = 1U;
+        state->scale = fmaxf(DPMZM_LOCK_ADAPTIVE_MIN_SCALE,
+                             state->scale * DPMZM_LOCK_ADAPTIVE_SHRINK);
+    } else {
+        state->same_direction_count++;
+        if (state->same_direction_count >= DPMZM_LOCK_ADAPTIVE_SAME_DIR_COUNT) {
+            state->scale = fminf(DPMZM_LOCK_ADAPTIVE_MAX_SCALE,
+                                 state->scale * DPMZM_LOCK_ADAPTIVE_GROWTH);
+        }
+    }
+
+    state->last_direction = direction;
+}
+
+static float lock_axis_current_bias(dpmzm_lock_axis_t axis)
+{
+    switch (axis) {
+    case DPMZM_LOCK_AXIS_I:
+        return s_dpmzm_ctx.bias_i_v;
+    case DPMZM_LOCK_AXIS_Q:
+        return s_dpmzm_ctx.bias_q_v;
+    case DPMZM_LOCK_AXIS_P:
+        return s_dpmzm_ctx.bias_p_v;
+    default:
+        return 0.0f;
+    }
+}
+
+static float lock_axis_anchor_bias(const dpmzm_lock_context_t *ctx,
+                                   dpmzm_lock_axis_t axis)
+{
+    if (ctx == NULL || !ctx->anchor_valid) {
+        return lock_axis_current_bias(axis);
+    }
+    switch (axis) {
+    case DPMZM_LOCK_AXIS_I:
+        return ctx->anchor_i_v;
+    case DPMZM_LOCK_AXIS_Q:
+        return ctx->anchor_q_v;
+    case DPMZM_LOCK_AXIS_P:
+        return ctx->anchor_p_v;
+    default:
+        return lock_axis_current_bias(axis);
+    }
+}
+
+static int apply_lock_axis_bias(dpmzm_lock_axis_t axis, float value)
+{
+    float vi = s_dpmzm_ctx.bias_i_v;
+    float vq = s_dpmzm_ctx.bias_q_v;
+    float vp = s_dpmzm_ctx.bias_p_v;
+
+    switch (axis) {
+    case DPMZM_LOCK_AXIS_I:
+        vi = value;
+        break;
+    case DPMZM_LOCK_AXIS_Q:
+        vq = value;
+        break;
+    case DPMZM_LOCK_AXIS_P:
+        vp = value;
+        break;
+    default:
+        return -1;
+    }
+
+    return app_dpmzm_scan_apply_bias_triplet(vi, vq, vp);
+}
+
+static void lock_set_stage_target(dpmzm_scan_request_t *req,
+                                  dpmzm_lock_axis_t axis)
+{
+    if (req == NULL) {
+        return;
+    }
+
+    if (axis == DPMZM_LOCK_AXIS_P) {
+        req->stage = DPMZM_SCAN_STAGE_QTP;
+        req->target = DPMZM_SCAN_TARGET_P;
+    } else if (axis == DPMZM_LOCK_AXIS_Q) {
+        req->stage = DPMZM_SCAN_STAGE_MITP;
+        req->target = DPMZM_SCAN_TARGET_Q;
+    } else {
+        req->stage = DPMZM_SCAN_STAGE_MITP;
+        req->target = DPMZM_SCAN_TARGET_I;
+    }
+}
+
+static float lock_metric_for_axis(dpmzm_lock_axis_t axis,
+                                  const dpmzm_measurement_t *m)
+{
+    if (m == NULL) {
+        return 0.0f;
+    }
+    switch (axis) {
+    case DPMZM_LOCK_AXIS_I:
+        return m->mag_fi;
+    case DPMZM_LOCK_AXIS_Q:
+        return m->mag_fq;
+    case DPMZM_LOCK_AXIS_P:
+        return m->mag_fsum;
+    default:
+        return 0.0f;
+    }
+}
 
 static bool pilot_generation_active_internal(void)
 {
@@ -1131,6 +1410,27 @@ static void fill_lock_request(dpmzm_lock_request_t *req)
     req->loop_interval_ms = DPMZM_LOCK_DEFAULT_INTERVAL_MS;
 }
 
+static void fill_lock_request_for_axis(dpmzm_lock_axis_t axis,
+                                       dpmzm_lock_request_t *req)
+{
+    float scale = 1.0f;
+
+    fill_lock_request(req);
+    if (req == NULL || axis >= DPMZM_LOCK_AXIS_COUNT) {
+        return;
+    }
+
+    scale = s_lock_adaptive[axis].scale;
+    if (scale <= 0.0f) {
+        scale = 1.0f;
+    }
+
+    req->gain_v = lock_axis_base_gain(axis) * scale;
+    req->max_step_v = fminf(lock_axis_base_max_step(axis) * scale,
+                            DPMZM_LOCK_ADAPTIVE_HARD_MAX_STEP_V);
+    req->iq_anchor_window_v = lock_axis_dynamic_window(axis);
+}
+
 static int apply_lock_step_result(const dpmzm_lock_step_result_t *result)
 {
     float vi = s_dpmzm_ctx.bias_i_v;
@@ -1158,6 +1458,108 @@ static int apply_lock_step_result(const dpmzm_lock_step_result_t *result)
     return app_dpmzm_scan_apply_bias_triplet(vi, vq, vp);
 }
 
+static bool measure_lock_axis_point(dpmzm_lock_axis_t axis,
+                                    float sweep_v,
+                                    uint32_t blocks,
+                                    dpmzm_lock_local_measurement_t *out)
+{
+    dpmzm_scan_request_t req;
+    dpmzm_measurement_t m;
+    float metric;
+
+    if (out == NULL || axis >= DPMZM_LOCK_AXIS_COUNT) {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+    fill_auto_scan_template(&req);
+    req.dump_mode = DPMZM_SCAN_DUMP_METRICS;
+    req.blocks = blocks;
+    req.settle_ms = DPMZM_LOCK_DEFAULT_SETTLE_MS;
+    lock_set_stage_target(&req, axis);
+
+    if (!dpmzm_scan_measure_point(&req, sweep_v, &m)) {
+        return false;
+    }
+
+    metric = lock_metric_for_axis(axis, &m);
+    out->valid = true;
+    out->sweep_v = sweep_v;
+    out->metric = metric;
+    out->objective = app_objective_from_metric(metric);
+    out->dbm = app_metric_to_dbm(metric);
+    out->dc_v = m.dc_mean;
+    return true;
+}
+
+static bool run_lock_local_recheck(dpmzm_lock_axis_t axis,
+                                   float center_v,
+                                   float window_v,
+                                   float step_v,
+                                   bool prefer_dc_limit,
+                                   float dc_limit_abs,
+                                   dpmzm_lock_local_measurement_t *best_out)
+{
+    dpmzm_lock_request_t req;
+    dpmzm_lock_local_measurement_t best;
+    dpmzm_lock_local_measurement_t best_metric_any;
+    float min_v = -10.0f;
+    float max_v = 10.0f;
+    float start_v;
+    float stop_v;
+    float value;
+    uint32_t blocks;
+    bool any = false;
+    bool any_dc_valid = false;
+
+    if (best_out == NULL || axis >= DPMZM_LOCK_AXIS_COUNT || step_v <= 0.0f) {
+        return false;
+    }
+
+    memset(&best, 0, sizeof(best));
+    memset(&best_metric_any, 0, sizeof(best_metric_any));
+    fill_lock_request_for_axis(axis, &req);
+    blocks = (axis == DPMZM_LOCK_AXIS_P) ? req.p_blocks : req.iq_blocks;
+
+    start_v = app_clampf(center_v - fabsf(window_v), min_v, max_v);
+    stop_v = app_clampf(center_v + fabsf(window_v), min_v, max_v);
+
+    if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
+        return false;
+    }
+
+    for (value = start_v; value <= stop_v + step_v * 0.5f; value += step_v) {
+        dpmzm_lock_local_measurement_t current;
+        float sweep_v = app_clampf(value, start_v, stop_v);
+
+        if (!measure_lock_axis_point(axis, sweep_v, blocks, &current)) {
+            app_dpmzm_scan_end();
+            return false;
+        }
+
+        if (!any || current.objective < best_metric_any.objective) {
+            best_metric_any = current;
+        }
+        any = true;
+
+        if (prefer_dc_limit && fabsf(current.dc_v) > dc_limit_abs) {
+            continue;
+        }
+        if (!any_dc_valid || current.objective < best.objective) {
+            best = current;
+            any_dc_valid = true;
+        }
+    }
+
+    app_dpmzm_scan_end();
+    if (!any) {
+        return false;
+    }
+
+    *best_out = any_dc_valid ? best : best_metric_any;
+    return true;
+}
+
 static bool run_lock_probe_once(dpmzm_lock_axis_t axis,
                                 dpmzm_lock_probe_result_t *result_out)
 {
@@ -1166,7 +1568,7 @@ static bool run_lock_probe_once(dpmzm_lock_axis_t axis,
     bool ok;
 
     memset(&result, 0, sizeof(result));
-    fill_lock_request(&req);
+    fill_lock_request_for_axis(axis, &req);
 
     if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
         printf("[dpmzm][lock] probe failed: onboard pilot start failed\r\n");
@@ -1189,6 +1591,277 @@ static bool run_lock_probe_once(dpmzm_lock_axis_t axis,
     return ok;
 }
 
+static void maybe_run_boundary_recheck(const dpmzm_lock_step_result_t *result)
+{
+    const dpmzm_lock_context_t *ctx;
+    dpmzm_lock_boundary_axis_t *state;
+    dpmzm_lock_local_measurement_t selected;
+    dpmzm_lock_axis_t axis;
+    float current_obj;
+    float degrade_db;
+    float old_anchor_v;
+    float old_window_v;
+    float shift_v;
+    float new_window_v;
+    uint32_t step_index;
+
+    if (result == NULL || !result->probe.valid) {
+        return;
+    }
+
+    axis = result->probe.axis;
+    if (axis != DPMZM_LOCK_AXIS_I && axis != DPMZM_LOCK_AXIS_Q) {
+        return;
+    }
+
+    state = &s_lock_boundary[axis];
+    if (state->window_v <= 0.0f) {
+        state->window_v = DPMZM_LOCK_DEFAULT_IQ_WINDOW_V;
+    }
+    if (state->cooldown_steps > 0) {
+        state->cooldown_steps--;
+    }
+
+    current_obj = app_objective_from_metric(result->probe.metric_center);
+    if (!state->valid || current_obj < state->best_objective) {
+        state->valid = true;
+        state->best_objective = current_obj;
+        state->best_dbm = result->probe.metric_center_dbm;
+        state->best_bias_v = result->probe.center_v;
+    }
+
+    if (result->clamped) {
+        state->clamp_streak++;
+        state->stable_steps = 0U;
+    } else {
+        state->clamp_streak = 0U;
+        if (state->window_v > DPMZM_LOCK_DEFAULT_IQ_WINDOW_V) {
+            state->stable_steps++;
+            if (state->stable_steps >= DPMZM_LOCK_BOUNDARY_SHRINK_STABLE) {
+                float old = state->window_v;
+                state->window_v = fmaxf(DPMZM_LOCK_DEFAULT_IQ_WINDOW_V,
+                                        state->window_v * DPMZM_LOCK_BOUNDARY_SHRINK);
+                state->stable_steps = 0U;
+                if (state->window_v < old - 1.0e-6f) {
+                    printf("[dpmzm][lock] boundary window shrink axis=%s %.4fV -> %.4fV\r\n",
+                           dpmzm_lock_axis_name(axis),
+                           (double)old,
+                           (double)state->window_v);
+                }
+            }
+        }
+    }
+
+    degrade_db = result->probe.metric_center_dbm - state->best_dbm;
+    if (state->cooldown_steps > 0 ||
+        state->clamp_streak < DPMZM_LOCK_BOUNDARY_COUNT ||
+        degrade_db < DPMZM_LOCK_BOUNDARY_DEGRADE_DB) {
+        return;
+    }
+
+    ctx = dpmzm_lock_get_context();
+    old_anchor_v = lock_axis_anchor_bias(ctx, axis);
+    old_window_v = state->window_v;
+    step_index = ctx == NULL ? 0U : (ctx->update_count + ctx->hold_count);
+
+    printf("[dpmzm][lock] boundary recheck start axis=%s center=%+.4fV degrade=%.2fdB window=+/-%.3fV\r\n",
+           dpmzm_lock_axis_name(axis),
+           (double)lock_axis_current_bias(axis),
+           (double)degrade_db,
+           (double)DPMZM_LOCK_BOUNDARY_WINDOW_V);
+
+    if (!run_lock_local_recheck(axis,
+                                lock_axis_current_bias(axis),
+                                DPMZM_LOCK_BOUNDARY_WINDOW_V,
+                                DPMZM_LOCK_BOUNDARY_STEP_V,
+                                false,
+                                0.0f,
+                                &selected)) {
+        printf("[dpmzm][lock] boundary recheck failed axis=%s\r\n",
+               dpmzm_lock_axis_name(axis));
+        state->cooldown_steps = DPMZM_LOCK_BOUNDARY_COOLDOWN_STEPS;
+        return;
+    }
+
+    (void)apply_lock_axis_bias(axis, selected.sweep_v);
+    dpmzm_lock_update_axis_anchor(axis, selected.sweep_v);
+
+    shift_v = fabsf(selected.sweep_v - old_anchor_v);
+    new_window_v = fmaxf(DPMZM_LOCK_DEFAULT_IQ_WINDOW_V,
+                         shift_v + DPMZM_LOCK_BOUNDARY_EXPAND_MARGIN_V);
+    if (state->last_recheck_step != 0U &&
+        step_index >= state->last_recheck_step &&
+        (step_index - state->last_recheck_step) <= DPMZM_LOCK_BOUNDARY_FAST_REPEAT) {
+        new_window_v = fmaxf(new_window_v,
+                             old_window_v * DPMZM_LOCK_BOUNDARY_FAST_EXPAND);
+    }
+    state->window_v = fminf(new_window_v, DPMZM_LOCK_BOUNDARY_MAX_WINDOW_V);
+    state->valid = true;
+    state->best_objective = selected.objective;
+    state->best_dbm = selected.dbm;
+    state->best_bias_v = selected.sweep_v;
+    state->clamp_streak = 0U;
+    state->stable_steps = 0U;
+    state->cooldown_steps = DPMZM_LOCK_BOUNDARY_COOLDOWN_STEPS;
+    state->last_recheck_step = step_index;
+
+    printf("[dpmzm][lock] boundary recheck axis=%s anchor %+.4fV -> %+.4fV metric=%.2fdBm dc=%+.6fV window %.4fV -> %.4fV\r\n",
+           dpmzm_lock_axis_name(axis),
+           (double)old_anchor_v,
+           (double)selected.sweep_v,
+           (double)selected.dbm,
+           (double)selected.dc_v,
+           (double)old_window_v,
+           (double)state->window_v);
+}
+
+static float update_dc_guard_average(float rise_db)
+{
+    uint8_t window = DPMZM_LOCK_DC_GUARD_AVG_WINDOW;
+    float sum = 0.0f;
+
+    if (window == 0U) {
+        return rise_db;
+    }
+
+    s_lock_dc_guard.rise_history_db[s_lock_dc_guard.history_index % window] = rise_db;
+    s_lock_dc_guard.history_index = (uint8_t)((s_lock_dc_guard.history_index + 1U) % window);
+    if (s_lock_dc_guard.history_count < window) {
+        s_lock_dc_guard.history_count++;
+    }
+
+    for (uint8_t i = 0U; i < s_lock_dc_guard.history_count; i++) {
+        sum += s_lock_dc_guard.rise_history_db[i];
+    }
+    return sum / (float)s_lock_dc_guard.history_count;
+}
+
+static bool dc_guard_should_trigger(float dc_now_v,
+                                    float *rise_db_out,
+                                    float *avg_db_out)
+{
+    float ref;
+    float ratio;
+    float rise_db;
+    float avg_db;
+
+    if (!s_lock_dc_guard.anchor_valid) {
+        s_lock_dc_guard.anchor_valid = true;
+        s_lock_dc_guard.anchor_dc_v = dc_now_v;
+    }
+
+    ref = fmaxf(fabsf(s_lock_dc_guard.anchor_dc_v), DPMZM_LOCK_DC_GUARD_FLOOR_V);
+    ratio = fabsf(dc_now_v) / ref;
+    rise_db = 20.0f * log10f(fmaxf(ratio, 1.0e-12f));
+    avg_db = update_dc_guard_average(rise_db);
+
+    if (rise_db_out != NULL) {
+        *rise_db_out = rise_db;
+    }
+    if (avg_db_out != NULL) {
+        *avg_db_out = avg_db;
+    }
+
+    if (s_lock_dc_guard.cooldown_steps > 0) {
+        s_lock_dc_guard.cooldown_steps--;
+        return false;
+    }
+
+    if (avg_db <= DPMZM_LOCK_DC_GUARD_RELEASE_DB) {
+        s_lock_dc_guard.armed = false;
+        s_lock_dc_guard.trigger_count = 0U;
+        return false;
+    }
+
+    if (avg_db <= DPMZM_LOCK_DC_GUARD_THRESHOLD_DB && !s_lock_dc_guard.armed) {
+        s_lock_dc_guard.trigger_count = 0U;
+        return false;
+    }
+
+    if (avg_db > DPMZM_LOCK_DC_GUARD_THRESHOLD_DB) {
+        s_lock_dc_guard.armed = true;
+    } else if (s_lock_dc_guard.armed) {
+        return false;
+    }
+
+    s_lock_dc_guard.trigger_count++;
+    if (s_lock_dc_guard.trigger_count >= DPMZM_LOCK_DC_GUARD_COUNT) {
+        s_lock_dc_guard.trigger_count = 0U;
+        s_lock_dc_guard.cooldown_steps = DPMZM_LOCK_DC_GUARD_COOLDOWN_STEPS;
+        return true;
+    }
+    return false;
+}
+
+static void maybe_run_dc_guard_recheck(const dpmzm_lock_step_result_t *result)
+{
+    static const dpmzm_lock_axis_t recheck_sequence[] = {
+        DPMZM_LOCK_AXIS_I,
+        DPMZM_LOCK_AXIS_Q,
+        DPMZM_LOCK_AXIS_P
+    };
+    float rise_db = 0.0f;
+    float avg_db = 0.0f;
+    float dc_limit_abs;
+    float best_dc_abs;
+    bool have_best_dc = false;
+
+    if (result == NULL || !result->probe.valid) {
+        return;
+    }
+
+    if (!dc_guard_should_trigger(result->probe.dc_center_v, &rise_db, &avg_db)) {
+        return;
+    }
+
+    dc_limit_abs = fmaxf(fabsf(s_lock_dc_guard.anchor_dc_v),
+                         DPMZM_LOCK_DC_GUARD_FLOOR_V) *
+                   powf(10.0f, DPMZM_LOCK_DC_GUARD_THRESHOLD_DB / 20.0f);
+    best_dc_abs = fabsf(s_lock_dc_guard.anchor_dc_v);
+
+    printf("[dpmzm][lock] dc guard recheck start: dc=%+.6fV rise=%.2fdB avg=%.2fdB limit_abs=%.6fV\r\n",
+           (double)result->probe.dc_center_v,
+           (double)rise_db,
+           (double)avg_db,
+           (double)dc_limit_abs);
+
+    for (uint32_t i = 0U; i < (uint32_t)(sizeof(recheck_sequence) / sizeof(recheck_sequence[0])); i++) {
+        dpmzm_lock_axis_t axis = recheck_sequence[i];
+        dpmzm_lock_local_measurement_t selected;
+        float window = (axis == DPMZM_LOCK_AXIS_P) ?
+                       DPMZM_LOCK_DC_RECHECK_P_WINDOW_V :
+                       DPMZM_LOCK_DC_RECHECK_IQ_WINDOW_V;
+
+        if (!run_lock_local_recheck(axis,
+                                    lock_axis_current_bias(axis),
+                                    window,
+                                    DPMZM_LOCK_DC_RECHECK_STEP_V,
+                                    true,
+                                    dc_limit_abs,
+                                    &selected)) {
+            printf("[dpmzm][lock] dc guard recheck axis=%s failed\r\n",
+                   dpmzm_lock_axis_name(axis));
+            continue;
+        }
+
+        (void)apply_lock_axis_bias(axis, selected.sweep_v);
+        if (!have_best_dc || fabsf(selected.dc_v) < best_dc_abs) {
+            best_dc_abs = fabsf(selected.dc_v);
+            have_best_dc = true;
+        }
+        printf("[dpmzm][lock] dc guard recheck axis=%s select=%+.4fV metric=%.2fdBm dc=%+.6fV\r\n",
+               dpmzm_lock_axis_name(axis),
+               (double)selected.sweep_v,
+               (double)selected.dbm,
+               (double)selected.dc_v);
+    }
+
+    if (have_best_dc && best_dc_abs <= fmaxf(fabsf(s_lock_dc_guard.anchor_dc_v),
+                                            DPMZM_LOCK_DC_GUARD_FLOOR_V)) {
+        s_lock_dc_guard.anchor_dc_v = best_dc_abs;
+    }
+}
+
 static bool run_lock_step_once(dpmzm_lock_axis_t axis,
                                bool print_result,
                                dpmzm_lock_step_result_t *result_out)
@@ -1199,7 +1872,7 @@ static bool run_lock_step_once(dpmzm_lock_axis_t axis,
     int apply_ret = 0;
 
     memset(&result, 0, sizeof(result));
-    fill_lock_request(&req);
+    fill_lock_request_for_axis(axis, &req);
 
     if (!app_dpmzm_scan_begin(req.scan_template.pilot_mode == DPMZM_SCAN_PILOT_ONBOARD)) {
         printf("[dpmzm][lock] step failed: onboard pilot start failed\r\n");
@@ -1222,6 +1895,13 @@ static bool run_lock_step_once(dpmzm_lock_axis_t axis,
         }
     }
 
+    if (ok) {
+        update_lock_adaptive_state(axis,
+                                   result.applied_step_v,
+                                   result.held_by_deadband,
+                                   result.clamped);
+    }
+
     if (print_result) {
         dpmzm_lock_print_step_result(&result);
         if (ok) {
@@ -1235,6 +1915,8 @@ static bool run_lock_step_once(dpmzm_lock_axis_t axis,
 
     if (ok) {
         dpmzm_lock_record_step(&result);
+        maybe_run_boundary_recheck(&result);
+        maybe_run_dc_guard_recheck(&result);
     } else {
         dpmzm_lock_record_fault(result.error_code);
     }
@@ -1350,6 +2032,120 @@ static void handle_auto_fine(void)
            apply_ret);
 }
 
+static void handle_lock_start(void);
+
+static bool parse_optional_auto_lock_biases(const char *cmd,
+                                            float *i_out,
+                                            float *q_out,
+                                            float *p_out)
+{
+    const char *args = NULL;
+    char *endptr = NULL;
+    float values[3] = {0.0f, 0.0f, 0.0f};
+
+    if (i_out == NULL || q_out == NULL || p_out == NULL) {
+        return false;
+    }
+
+    if (strncmp(cmd, "auto lock", 9) == 0) {
+        args = cmd + strlen("auto lock");
+    } else if (strncmp(cmd, "auto run", 8) == 0) {
+        args = cmd + strlen("auto run");
+    } else {
+        return false;
+    }
+
+    while (*args == ' ') {
+        args++;
+    }
+    if (*args == '\0') {
+        *i_out = 0.0f;
+        *q_out = 0.0f;
+        *p_out = 0.0f;
+        return true;
+    }
+
+    for (uint32_t idx = 0U; idx < 3U; idx++) {
+        values[idx] = strtof(args, &endptr);
+        if (endptr == args) {
+            return false;
+        }
+        args = endptr;
+        while (*args == ' ') {
+            args++;
+        }
+    }
+    if (*args != '\0') {
+        return false;
+    }
+
+    *i_out = app_clampf(values[0], -10.0f, 10.0f);
+    *q_out = app_clampf(values[1], -10.0f, 10.0f);
+    *p_out = app_clampf(values[2], -10.0f, 10.0f);
+    return true;
+}
+
+static void handle_auto_lock(const char *cmd)
+{
+    const dpmzm_auto_context_t *auto_ctx;
+    float init_i = 0.0f;
+    float init_q = 0.0f;
+    float init_p = 0.0f;
+
+    if (!parse_optional_auto_lock_biases(cmd, &init_i, &init_q, &init_p)) {
+        printf("[dpmzm][auto] usage: auto lock [initial_i initial_q initial_p]\r\n");
+        printf("[dpmzm][auto] alias: auto run [initial_i initial_q initial_p]\r\n");
+        return;
+    }
+
+    printf("[dpmzm][auto] full auto-lock start: initial I=%+.3fV Q=%+.3fV P=%+.3fV\r\n",
+           (double)init_i,
+           (double)init_q,
+           (double)init_p);
+
+    dpmzm_lock_stop();
+    reset_lock_runtime_state();
+    handle_set_dump("set dump metrics");
+    if (s_dpmzm_ctx.config->pilot_source == DPMZM_PILOT_SOURCE_ONBOARD &&
+        !s_dpmzm_ctx.pilot_output_enabled) {
+        handle_set_pilot_open("set pilot-open on");
+        if (!s_dpmzm_ctx.pilot_output_enabled) {
+            printf("[dpmzm][auto] full auto-lock refused: pilot output failed\r\n");
+            return;
+        }
+    }
+
+    if (app_dpmzm_scan_apply_bias_triplet(init_i, init_q, init_p) != 0) {
+        printf("[dpmzm][auto] full auto-lock refused: initial bias apply failed\r\n");
+        return;
+    }
+
+    handle_auto_coarse();
+    auto_ctx = dpmzm_auto_get_context();
+    if (auto_ctx == NULL || !auto_ctx->has_result ||
+        auto_ctx->last_result.error != DPMZM_AUTO_OK ||
+        !auto_ctx->last_result.p_qtp_valid ||
+        !auto_ctx->last_result.i_mitp_valid ||
+        !auto_ctx->last_result.q_mitp_valid) {
+        printf("[dpmzm][auto] full auto-lock stopped: coarse failed\r\n");
+        return;
+    }
+
+    handle_auto_fine();
+    auto_ctx = dpmzm_auto_get_context();
+    if (auto_ctx == NULL || !auto_ctx->has_fine_result ||
+        auto_ctx->last_fine_result.error != DPMZM_AUTO_OK ||
+        !auto_ctx->last_fine_result.p_qtp_valid ||
+        !auto_ctx->last_fine_result.i_mitp_valid ||
+        !auto_ctx->last_fine_result.q_mitp_valid) {
+        printf("[dpmzm][auto] full auto-lock stopped: fine failed\r\n");
+        return;
+    }
+
+    handle_lock_start();
+    printf("[dpmzm][auto] full auto-lock done: lock running after auto fine\r\n");
+}
+
 static void handle_lock_probe(const char *cmd)
 {
     dpmzm_lock_axis_t axis;
@@ -1399,8 +2195,9 @@ static void handle_lock_start(void)
     dpmzm_lock_start_with_anchor(s_dpmzm_ctx.bias_i_v,
                                  s_dpmzm_ctx.bias_q_v,
                                  s_dpmzm_ctx.bias_p_v);
+    reset_lock_runtime_state();
     s_lock_last_cycle_ms = 0U;
-    printf("[dpmzm][lock] start: sequence P-I-Q gradient, anchor I=%+.3fV Q=%+.3fV P=%+.3fV\r\n",
+    printf("[dpmzm][lock] start: sequence P-I-Q adaptive gradient, anchor I=%+.3fV Q=%+.3fV P=%+.3fV\r\n",
            (double)s_dpmzm_ctx.bias_i_v,
            (double)s_dpmzm_ctx.bias_q_v,
            (double)s_dpmzm_ctx.bias_p_v);
@@ -1428,6 +2225,22 @@ static void handle_lock_status(void)
     printf("  window:     IQ=+/-%.3fV P=+/-%.3fV\r\n",
            (double)req.iq_anchor_window_v,
            (double)req.p_anchor_window_v);
+    printf("  adaptive:   scale I=%.2f Q=%.2f P=%.2f hard_max=%.3fV\r\n",
+           (double)s_lock_adaptive[DPMZM_LOCK_AXIS_I].scale,
+           (double)s_lock_adaptive[DPMZM_LOCK_AXIS_Q].scale,
+           (double)s_lock_adaptive[DPMZM_LOCK_AXIS_P].scale,
+           (double)DPMZM_LOCK_ADAPTIVE_HARD_MAX_STEP_V);
+    printf("  boundary:   win I=%.3fV Q=%.3fV degrade=%.1fdB count=%u\r\n",
+           (double)s_lock_boundary[DPMZM_LOCK_AXIS_I].window_v,
+           (double)s_lock_boundary[DPMZM_LOCK_AXIS_Q].window_v,
+           (double)DPMZM_LOCK_BOUNDARY_DEGRADE_DB,
+           (unsigned)DPMZM_LOCK_BOUNDARY_COUNT);
+    printf("  dc guard:   anchor=%s %.6fV threshold=%.1fdB release=%.1fdB count=%u\r\n",
+           s_lock_dc_guard.anchor_valid ? "yes" : "no",
+           (double)s_lock_dc_guard.anchor_dc_v,
+           (double)DPMZM_LOCK_DC_GUARD_THRESHOLD_DB,
+           (double)DPMZM_LOCK_DC_GUARD_RELEASE_DB,
+           (unsigned)DPMZM_LOCK_DC_GUARD_COUNT);
     printf("  settle:     %lu ms\r\n", (unsigned long)req.scan_template.settle_ms);
     printf("  interval:   %lu ms\r\n", (unsigned long)req.loop_interval_ms);
 }
@@ -1667,6 +2480,7 @@ void app_dpmzm_init(void)
     s_pilot_dma_error_count = 0U;
     s_lock_last_cycle_ms = 0U;
     s_lock_cycle_busy = false;
+    reset_lock_runtime_state();
     s_dpmzm_ctx.initialized = true;
 }
 
@@ -1742,6 +2556,11 @@ void app_dpmzm_handle_command(const char *cmd)
         handle_set_dump(cmd);
     } else if (strncmp(cmd, "capture raw ", 12) == 0) {
         handle_capture_raw(cmd);
+    } else if (strcmp(cmd, "auto lock") == 0 ||
+               strncmp(cmd, "auto lock ", 10) == 0 ||
+               strcmp(cmd, "auto run") == 0 ||
+               strncmp(cmd, "auto run ", 9) == 0) {
+        handle_auto_lock(cmd);
     } else if (strcmp(cmd, "auto coarse") == 0) {
         handle_auto_coarse();
     } else if (strcmp(cmd, "auto fine") == 0) {

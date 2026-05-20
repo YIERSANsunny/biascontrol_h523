@@ -309,6 +309,24 @@ void dpmzm_lock_start_with_anchor(float bias_i_v, float bias_q_v, float bias_p_v
     s_lock_ctx.anchor_p_v = bias_p_v;
 }
 
+void dpmzm_lock_update_axis_anchor(dpmzm_lock_axis_t axis, float bias_v)
+{
+    s_lock_ctx.anchor_valid = true;
+    switch (axis) {
+    case DPMZM_LOCK_AXIS_I:
+        s_lock_ctx.anchor_i_v = bias_v;
+        break;
+    case DPMZM_LOCK_AXIS_Q:
+        s_lock_ctx.anchor_q_v = bias_v;
+        break;
+    case DPMZM_LOCK_AXIS_P:
+        s_lock_ctx.anchor_p_v = bias_v;
+        break;
+    default:
+        break;
+    }
+}
+
 void dpmzm_lock_stop(void)
 {
     s_lock_ctx.enabled = false;

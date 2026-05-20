@@ -99,6 +99,7 @@ bool dpmzm_lock_axis_from_char(char c, dpmzm_lock_axis_t *axis_out);
 
 void dpmzm_lock_start(void);
 void dpmzm_lock_start_with_anchor(float bias_i_v, float bias_q_v, float bias_p_v);
+void dpmzm_lock_update_axis_anchor(dpmzm_lock_axis_t axis, float bias_v);
 void dpmzm_lock_stop(void);
 dpmzm_lock_axis_t dpmzm_lock_next_axis(void);
 void dpmzm_lock_record_step(const dpmzm_lock_step_result_t *result);
