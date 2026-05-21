@@ -1,4 +1,5 @@
 #include "app_main.h"
+#include "app_main_dpmzm.h"
 #include "app_uart.h"
 #include "drv_board.h"
 #include "drv_dac8568.h"
@@ -102,6 +103,28 @@ typedef struct {
 
 static app_context_t ctx;
 
+typedef enum {
+    APP_RUNTIME_MODE_MZM = 0,
+    APP_RUNTIME_MODE_DPMZM,
+    APP_RUNTIME_MODE_IDLE,
+} app_runtime_mode_t;
+
+static app_runtime_mode_t s_runtime_mode = APP_RUNTIME_MODE_MZM;
+
+static const char *runtime_mode_name(app_runtime_mode_t mode)
+{
+    switch (mode) {
+    case APP_RUNTIME_MODE_MZM:
+        return "mzm";
+    case APP_RUNTIME_MODE_DPMZM:
+        return "dpmzm";
+    case APP_RUNTIME_MODE_IDLE:
+        return "idle";
+    default:
+        return "unknown";
+    }
+}
+
 /* ========================================================================= */
 /*  State name table                                                         */
 /* ========================================================================= */
@@ -133,6 +156,93 @@ static void transition_to(app_state_t new_state)
     ctx.state = new_state;
     ctx.tick_ms = HAL_GetTick();
     ctx.state_enter_ms = ctx.tick_ms;
+}
+
+static void stop_mzm_runtime(void)
+{
+    if (ctx.state == APP_STATE_INIT ||
+        ctx.state == APP_STATE_HW_SELFTEST ||
+        ctx.state == APP_STATE_FAULT) {
+        return;
+    }
+
+    bias_ctrl_stop(&ctx.bias_ctrl);
+    ads131m02_stop_continuous();
+    transition_to(APP_STATE_IDLE);
+}
+
+static void stop_dpmzm_runtime(void)
+{
+    const app_dpmzm_context_t *dpmzm_ctx = app_dpmzm_get_context();
+
+    if (dpmzm_ctx == NULL || !dpmzm_ctx->initialized) {
+        return;
+    }
+
+    app_dpmzm_handle_command("lock stop");
+    if (app_dpmzm_pilot_output_active()) {
+        app_dpmzm_handle_command("set pilot-open off");
+    }
+}
+
+static void switch_runtime_mode(app_runtime_mode_t new_mode)
+{
+    if (s_runtime_mode == new_mode) {
+        return;
+    }
+
+    if (new_mode == APP_RUNTIME_MODE_MZM) {
+        stop_dpmzm_runtime();
+    } else if (new_mode == APP_RUNTIME_MODE_DPMZM) {
+        stop_mzm_runtime();
+        if (!app_dpmzm_get_context()->initialized) {
+            app_dpmzm_init();
+        }
+    } else {
+        stop_mzm_runtime();
+        stop_dpmzm_runtime();
+    }
+
+    s_runtime_mode = new_mode;
+    printf("[app] mode -> %s\r\n", runtime_mode_name(s_runtime_mode));
+}
+
+static bool handle_mode_command(const char *cmd)
+{
+    if (strcmp(cmd, "mode") == 0 || strcmp(cmd, "mode status") == 0) {
+        printf("[app] mode: %s\r\n", runtime_mode_name(s_runtime_mode));
+        printf("[app] mzm state: %s\r\n", app_state_name(ctx.state));
+        if (app_dpmzm_get_context()->initialized) {
+            const app_dpmzm_context_t *dpmzm_ctx = app_dpmzm_get_context();
+            printf("[app] dpmzm initialized: yes, I=%+.3fV Q=%+.3fV P=%+.3fV\r\n",
+                   (double)dpmzm_ctx->bias_i_v,
+                   (double)dpmzm_ctx->bias_q_v,
+                   (double)dpmzm_ctx->bias_p_v);
+        } else {
+            printf("[app] dpmzm initialized: no\r\n");
+        }
+        return true;
+    }
+
+    if (strcmp(cmd, "mode mzm") == 0) {
+        switch_runtime_mode(APP_RUNTIME_MODE_MZM);
+        return true;
+    }
+    if (strcmp(cmd, "mode dpmzm") == 0) {
+        switch_runtime_mode(APP_RUNTIME_MODE_DPMZM);
+        return true;
+    }
+    if (strcmp(cmd, "mode idle") == 0) {
+        switch_runtime_mode(APP_RUNTIME_MODE_IDLE);
+        return true;
+    }
+
+    if (strncmp(cmd, "mode ", 5) == 0) {
+        printf("[app] usage: mode idle|mzm|dpmzm|status\r\n");
+        return true;
+    }
+
+    return false;
 }
 
 /* ========================================================================= */
@@ -1361,6 +1471,16 @@ void app_run(void)
         return;
     }
 
+    if (ctx.state == APP_STATE_IDLE) {
+        if (s_runtime_mode == APP_RUNTIME_MODE_DPMZM) {
+            app_dpmzm_run();
+            return;
+        }
+        if (s_runtime_mode == APP_RUNTIME_MODE_IDLE) {
+            return;
+        }
+    }
+
     switch (ctx.state) {
     case APP_STATE_INIT:
         state_init();
@@ -1396,6 +1516,39 @@ const app_context_t *app_get_context(void)
 
 void app_handle_command(const char *cmd)
 {
+    if (cmd == NULL || cmd[0] == '\0') {
+        return;
+    }
+
+    if (handle_mode_command(cmd)) {
+        return;
+    }
+
+    if (strcmp(cmd, "dpmzm") == 0) {
+        switch_runtime_mode(APP_RUNTIME_MODE_DPMZM);
+        app_dpmzm_handle_command("status");
+        return;
+    }
+    if (strncmp(cmd, "dpmzm ", 6) == 0) {
+        switch_runtime_mode(APP_RUNTIME_MODE_DPMZM);
+        app_dpmzm_handle_command(cmd + 6);
+        return;
+    }
+
+    if (strcmp(cmd, "mzm") == 0) {
+        switch_runtime_mode(APP_RUNTIME_MODE_MZM);
+        cmd = "status";
+    } else if (strncmp(cmd, "mzm ", 4) == 0) {
+        switch_runtime_mode(APP_RUNTIME_MODE_MZM);
+        cmd += 4;
+    } else if (s_runtime_mode == APP_RUNTIME_MODE_DPMZM) {
+        app_dpmzm_handle_command(cmd);
+        return;
+    } else if (s_runtime_mode == APP_RUNTIME_MODE_IDLE) {
+        printf("[app] mode is idle; use 'mode mzm' or 'mode dpmzm'\r\n");
+        return;
+    }
+
     if (strcmp(cmd, "start") == 0) {
         if (ctx.state == APP_STATE_IDLE) {
             /* Initialize bias controller with current config */
@@ -1460,6 +1613,7 @@ void app_handle_command(const char *cmd)
     } else if (strcmp(cmd, "status") == 0) {
         const harmonic_data_t *h = bias_ctrl_get_harmonics(&ctx.bias_ctrl);
         float ctrl_error = ctx.bias_ctrl.last_error;
+        printf("Mode:  %s\r\n", runtime_mode_name(s_runtime_mode));
         printf("State: %s\r\n", app_state_name(ctx.state));
         printf("Bias:  %.3f V\r\n", (double)bias_ctrl_get_bias_voltage(&ctx.bias_ctrl));
         printf("Lock:  %s\r\n", bias_ctrl_is_locked(&ctx.bias_ctrl) ? "YES" : "NO");
