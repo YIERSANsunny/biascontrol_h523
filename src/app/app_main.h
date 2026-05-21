@@ -38,6 +38,12 @@ const app_context_t *app_get_context(void);
  * Called when a complete command line is received.
  *
  * Supported commands:
+ *   "mode status"        — print active runtime namespace (mzm/dpmzm/idle)
+ *   "mode mzm"           — route bare commands to the legacy MZM app
+ *   "mode dpmzm"         — route bare commands to the DPMZM app
+ *   "mode idle"          — stop active control paths and keep shell alive
+ *   "mzm <cmd>"          — explicitly run a legacy MZM command
+ *   "dpmzm <cmd>"        — explicitly run a DPMZM command
  *   "start"              — begin closed-loop bias control
  *   "stop"               — stop bias control
  *   "status"             — print state, bias voltage, lock status
