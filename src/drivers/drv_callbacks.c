@@ -11,6 +11,7 @@
  * This file must NOT be placed inside cubemx/ (gitignored).
  */
 
+#include "app_main_dpmzm.h"
 #include "drv_ads131m02.h"
 #include "drv_board.h"
 #include "drv_dac8568.h"
@@ -44,7 +45,18 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
 {
     if (hspi == &hspi1) {
-        dac8568_dma_tx_cplt();
+        if (app_dpmzm_pilot_output_active()) {
+            app_dpmzm_pilot_spi_tx_cplt();
+        } else {
+            dac8568_dma_tx_cplt();
+        }
+    }
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi == &hspi1 && app_dpmzm_pilot_output_active()) {
+        app_dpmzm_pilot_spi_error();
     }
 }
 
