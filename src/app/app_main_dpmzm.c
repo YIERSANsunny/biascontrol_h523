@@ -74,6 +74,7 @@ static float s_scan_restore_bias_p_v = 0.0f;
 #define DPMZM_LOCK_DC_RECHECK_P_WINDOW_V    0.10f
 #define DPMZM_LOCK_DC_RECHECK_STEP_V        0.01f
 #define DPMZM_LOCK_DBM_FLOOR_MW             1.0e-15f
+#define DPMZM_DAC_DMA_WAIT_TIMEOUT_MS       5U
 
 /*
  * The pilot phase accumulator must use TIM6's actual update rate. A hardcoded
@@ -522,39 +523,71 @@ static dpmzm_scan_dump_mode_t to_scan_dump_mode(dpmzm_dump_mode_t mode)
     }
 }
 
+static int wait_dac_dma_ready_for_dpmzm(void)
+{
+    uint32_t t0 = HAL_GetTick();
+    while (dac8568_send_raw_is_inflight()) {
+        if ((HAL_GetTick() - t0) > DPMZM_DAC_DMA_WAIT_TIMEOUT_MS) {
+            return -2;
+        }
+    }
+    return 0;
+}
+
+static int dpmzm_set_dac_voltage_paced(uint8_t channel, float voltage)
+{
+    int ret = wait_dac_dma_ready_for_dpmzm();
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = dac8568_set_voltage(channel, voltage);
+    if (ret != 0) {
+        return ret;
+    }
+
+    return wait_dac_dma_ready_for_dpmzm();
+}
+
 static int apply_biases(void)
 {
-    int ret_i = dac8568_set_voltage(s_dpmzm_ctx.config->bias_i_dac_channel,
-                                    s_dpmzm_ctx.bias_i_v);
-    int ret_q = dac8568_set_voltage(s_dpmzm_ctx.config->bias_q_dac_channel,
-                                    s_dpmzm_ctx.bias_q_v);
-    int ret_p = dac8568_set_voltage(s_dpmzm_ctx.config->bias_p_dac_channel,
-                                    s_dpmzm_ctx.bias_p_v);
-
+    int ret_i = dpmzm_set_dac_voltage_paced(s_dpmzm_ctx.config->bias_i_dac_channel,
+                                            s_dpmzm_ctx.bias_i_v);
     if (ret_i != 0) {
         return ret_i;
     }
+
+    int ret_q = dpmzm_set_dac_voltage_paced(s_dpmzm_ctx.config->bias_q_dac_channel,
+                                            s_dpmzm_ctx.bias_q_v);
     if (ret_q != 0) {
         return ret_q;
     }
+
+    int ret_p = dpmzm_set_dac_voltage_paced(s_dpmzm_ctx.config->bias_p_dac_channel,
+                                            s_dpmzm_ctx.bias_p_v);
+    if (ret_p != 0) {
+        return ret_p;
+    }
+
     s_p_bias_dirty = false;
     s_pending_p_bias_v = s_dpmzm_ctx.bias_p_v;
-    return ret_p;
+    return 0;
 }
 
 static int apply_drive(float tone_i_v, float tone_q_v)
 {
-    int ret_i = dac8568_set_voltage(s_dpmzm_ctx.config->bias_i_dac_channel,
-                                    s_dpmzm_ctx.bias_i_v + tone_i_v);
-    int ret_q = dac8568_set_voltage(s_dpmzm_ctx.config->bias_q_dac_channel,
-                                    s_dpmzm_ctx.bias_q_v + tone_q_v);
-
+    int ret_i = dpmzm_set_dac_voltage_paced(s_dpmzm_ctx.config->bias_i_dac_channel,
+                                            s_dpmzm_ctx.bias_i_v + tone_i_v);
     if (ret_i != 0) {
         return ret_i;
     }
+
+    int ret_q = dpmzm_set_dac_voltage_paced(s_dpmzm_ctx.config->bias_q_dac_channel,
+                                            s_dpmzm_ctx.bias_q_v + tone_q_v);
     if (ret_q != 0) {
         return ret_q;
     }
+
     return 0;
 }
 
