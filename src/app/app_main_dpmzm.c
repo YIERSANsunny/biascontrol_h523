@@ -1,7 +1,7 @@
 #include "app_main_dpmzm.h"
 #include "ctrl_auto_dpmzm.h"
+#include "ctrl_dpmzm_dsp.h"
 #include "ctrl_lock_dpmzm.h"
-#include "dsp_types.h"
 #include "ctrl_scan_dpmzm.h"
 #include "drv_ads131m02.h"
 #include "drv_board.h"
@@ -82,6 +82,10 @@ static float s_scan_restore_bias_p_v = 0.0f;
  * tree produced a different TIM6 input clock.
  */
 #define DPMZM_PILOT_TIM6_RATE_FALLBACK_HZ 16000.0f
+#define DPMZM_PILOT_TIM6_PRESCALER        124U
+#define DPMZM_PILOT_TIM6_PERIOD           124U
+#define DPMZM_PILOT_TIM6_RATE_MIN_HZ      15000.0f
+#define DPMZM_PILOT_TIM6_RATE_MAX_HZ      17000.0f
 
 static bool s_pilot_timer_running = false;
 static volatile float s_pilot_timer_rate_hz = DPMZM_PILOT_TIM6_RATE_FALLBACK_HZ;
@@ -398,6 +402,43 @@ static float compute_tim6_update_rate_hz(void)
 static void refresh_pilot_timer_rate(void)
 {
     s_pilot_timer_rate_hz = compute_tim6_update_rate_hz();
+}
+
+static bool pilot_timer_rate_in_range(float rate_hz)
+{
+    return rate_hz >= DPMZM_PILOT_TIM6_RATE_MIN_HZ &&
+           rate_hz <= DPMZM_PILOT_TIM6_RATE_MAX_HZ;
+}
+
+static bool ensure_pilot_tim6_update_rate(void)
+{
+    /*
+     * The unified mainline CubeMX project configures TIM6 as a slow 100 Hz
+     * housekeeping timer.  DPMZM onboard-pilot generation needs a DAC update
+     * clock near 16 kHz, otherwise the configured 1 kHz / 1.2 kHz pilots are
+     * never actually synthesized at the DAC outputs.
+     */
+    if (htim6.Init.Prescaler == DPMZM_PILOT_TIM6_PRESCALER &&
+        htim6.Init.Period == DPMZM_PILOT_TIM6_PERIOD) {
+        refresh_pilot_timer_rate();
+        return true;
+    }
+
+    if (s_pilot_timer_running) {
+        (void)HAL_TIM_Base_Stop_IT(&htim6);
+        s_pilot_timer_running = false;
+    }
+
+    htim6.Init.Prescaler = DPMZM_PILOT_TIM6_PRESCALER;
+    htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim6.Init.Period = DPMZM_PILOT_TIM6_PERIOD;
+    htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+    if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
+        return false;
+    }
+
+    refresh_pilot_timer_rate();
+    return true;
 }
 
 static void init_pilot_lut_once(void)
@@ -733,7 +774,11 @@ static bool start_pilot_timer(void)
     }
 
     init_pilot_lut_once();
-    refresh_pilot_timer_rate();
+    if (!ensure_pilot_tim6_update_rate()) {
+        s_pilot_timer_running = false;
+        printf("[dpmzm] WARN: failed to configure TIM6 pilot rate\r\n");
+        return false;
+    }
 
     if (s_pilot_timer_running) {
         __HAL_TIM_SET_COUNTER(&htim6, 0U);
@@ -940,7 +985,7 @@ static void print_status(void)
            (double)dac_code_to_pin_voltage(code_p));
     printf("  note:          status is target/model only, no analog readback\r\n");
     printf("  adc dsp fs:    %u Hz\r\n",
-           (unsigned)DSP_SAMPLE_RATE_HZ);
+           (unsigned)DPMZM_DSP_SAMPLE_RATE_HZ);
     printf("  pilot source:  %s\r\n",
            pilot_source_name(s_dpmzm_ctx.config->pilot_source));
     printf("  pilot output:  %s\r\n",
@@ -948,8 +993,9 @@ static void print_status(void)
     printf("  pilot timer:   %s, tim6_state=%lu\r\n",
            s_pilot_timer_running ? "running" : "stopped",
            (unsigned long)htim6.State);
-    printf("  pilot tim6 fs: %.2f Hz\r\n",
-           (double)pilot_timer_rate_hz);
+    printf("  pilot tim6 fs: %.2f Hz (%s)\r\n",
+           (double)pilot_timer_rate_hz,
+           pilot_timer_rate_in_range(pilot_timer_rate_hz) ? "ok" : "warn");
     printf("  pilot actual:  irq=%.1f Hz sched=%.1f Hz, irq=%lu sched=%lu\r\n",
            (double)diag_irq_rate_hz,
            (double)diag_schedule_rate_hz,
@@ -986,6 +1032,7 @@ static void print_debug(void)
     bool pilot_dma_contains_p;
     uint32_t scan_age_ms;
     uint32_t phase_age_ms;
+    float pilot_timer_rate_hz = compute_tim6_update_rate_hz();
 
     dpmzm_scan_trace_snapshot(&scan_trace);
 
@@ -1041,9 +1088,13 @@ static void print_debug(void)
            (unsigned long)scan_trace.pilot_bias_apply_fail_count,
            (unsigned long)scan_trace.finalize_fail_count,
            (unsigned long)scan_trace.point_overflow_fail_count);
-    printf("  pilot:       timer=%s tim6_state=%lu dma=%s frame=%u/%u pframe=%s irq=%lu sched=%lu drops=%lu errors=%lu\r\n",
+    printf("  pilot:       timer=%s tim6_state=%lu fs=%.2fHz(%s) psc=%lu arr=%lu dma=%s frame=%u/%u pframe=%s irq=%lu sched=%lu drops=%lu errors=%lu\r\n",
            s_pilot_timer_running ? "running" : "stopped",
            (unsigned long)htim6.State,
+           (double)pilot_timer_rate_hz,
+           pilot_timer_rate_in_range(pilot_timer_rate_hz) ? "ok" : "warn",
+           (unsigned long)htim6.Instance->PSC,
+           (unsigned long)htim6.Instance->ARR,
            pilot_dma_active ? "active" : "idle",
            (unsigned)pilot_dma_frame_index,
            (unsigned)pilot_dma_frame_count,
@@ -2328,7 +2379,7 @@ static void print_capture_raw_line(uint32_t sample_index,
            (long)sample->ch1_code,
            (double)ch0_v,
            (double)ch1_v,
-           (unsigned)DSP_SAMPLE_RATE_HZ,
+           (unsigned)DPMZM_DSP_SAMPLE_RATE_HZ,
            (double)bias_i_v,
            (double)bias_q_v,
            (double)bias_p_v,

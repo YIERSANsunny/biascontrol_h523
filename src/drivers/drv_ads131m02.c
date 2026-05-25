@@ -281,7 +281,7 @@ int ads131m02_init(void)
         return ret;
     }
 
-    printf("[adc] configured: OSR=128, GAIN=1, 64kSPS\r\n");
+    printf("[adc] configured: OSR=128, GAIN=1, 32kSPS\r\n");
     return 0;
 }
 

@@ -83,7 +83,7 @@
 /* --- ADC ADS131M02 parameters --- */
 #define ADC_CHANNELS            2
 #define ADC_RESOLUTION_BITS     24
-#define ADC_SAMPLE_RATE_HZ      64000  /* OSR=128, HR mode, 8.192 MHz CLKIN */
+#define ADC_SAMPLE_RATE_HZ      32000  /* OSR=128, HR mode, DPMZM validated path */
 
 /* ========================================================================= */
 /*  Board-level functions                                                    */

@@ -1,8 +1,8 @@
 #include "ctrl_scan_dpmzm.h"
+#include "ctrl_dpmzm_dsp.h"
 #include "drv_ads131m02.h"
 #include "drv_board.h"
 #include "drv_dac8568.h"
-#include "dsp_types.h"
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -14,8 +14,8 @@
 #define DPMZM_SCAN_DRDY_TIMEOUT_MS 5U
 #define DPMZM_SCAN_DISCARD_BLOCKS_AFTER_SETTLE 1U
 
-static float s_scan_block_ac[DSP_GOERTZEL_BLOCK_SIZE];
-static float s_scan_block_dc[DSP_GOERTZEL_BLOCK_SIZE];
+static float s_scan_block_ac[DPMZM_DSP_GOERTZEL_BLOCK_SIZE];
+static float s_scan_block_dc[DPMZM_DSP_GOERTZEL_BLOCK_SIZE];
 volatile dpmzm_scan_trace_t g_dpmzm_scan_trace;
 static dpmzm_scan_trace_error_t s_last_sample_error = DPMZM_SCAN_TRACE_ERR_NONE;
 
@@ -193,7 +193,7 @@ static void scan_trace_begin_point(const dpmzm_scan_request_t *req,
     g_dpmzm_scan_trace.block_index = 0U;
     g_dpmzm_scan_trace.sample_index = 0U;
     g_dpmzm_scan_trace.requested_blocks = req->blocks;
-    g_dpmzm_scan_trace.samples_per_block = DSP_GOERTZEL_BLOCK_SIZE;
+    g_dpmzm_scan_trace.samples_per_block = DPMZM_DSP_GOERTZEL_BLOCK_SIZE;
     g_dpmzm_scan_trace.start_tick_ms = now;
     g_dpmzm_scan_trace.phase_tick_ms = now;
     g_dpmzm_scan_trace.last_tick_ms = now;
@@ -508,7 +508,7 @@ static void print_raw_line(const dpmzm_scan_request_t *req,
            (unsigned long)block_id,
            (unsigned long)sample_index,
            (double)sample_ac_v,
-           (unsigned)DSP_SAMPLE_RATE_HZ);
+           (unsigned)DPMZM_DSP_SAMPLE_RATE_HZ);
 }
 
 bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
@@ -554,7 +554,7 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
      * steady-state samples only.
      */
     scan_trace_phase(DPMZM_SCAN_TRACE_DISCARD);
-    if (!discard_settle_samples(DSP_GOERTZEL_BLOCK_SIZE *
+    if (!discard_settle_samples(DPMZM_DSP_GOERTZEL_BLOCK_SIZE *
                                 DPMZM_SCAN_DISCARD_BLOCKS_AFTER_SETTLE)) {
         scan_trace_error(s_last_sample_error == DPMZM_SCAN_TRACE_ERR_NONE ?
                          DPMZM_SCAN_TRACE_ERR_DISCARD :
@@ -569,18 +569,18 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
     dpmzm_measure_init_select(&measure_ctx,
                               req->pilot_i_freq_hz,
                               req->pilot_q_freq_hz,
-                              (float)DSP_SAMPLE_RATE_HZ,
-                              DSP_GOERTZEL_BLOCK_SIZE,
+                              (float)DPMZM_DSP_SAMPLE_RATE_HZ,
+                              DPMZM_DSP_GOERTZEL_BLOCK_SIZE,
                               scan_measure_flags(req));
     if (req->pilot_mode == DPMZM_SCAN_PILOT_ONBOARD &&
         !req->continuous_onboard_pilot) {
         tone_gen_init(&tone_i,
                       req->pilot_i_freq_hz,
-                      (float)DSP_SAMPLE_RATE_HZ,
+                      (float)DPMZM_DSP_SAMPLE_RATE_HZ,
                       req->pilot_i_amp_v);
         tone_gen_init(&tone_q,
                       req->pilot_q_freq_hz,
-                      (float)DSP_SAMPLE_RATE_HZ,
+                      (float)DPMZM_DSP_SAMPLE_RATE_HZ,
                       req->pilot_q_amp_v);
     }
 
@@ -597,7 +597,7 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
         }
 
         scan_trace_phase(DPMZM_SCAN_TRACE_MEASURE);
-        for (s = 0; s < DSP_GOERTZEL_BLOCK_SIZE; s++) {
+        for (s = 0; s < DPMZM_DSP_GOERTZEL_BLOCK_SIZE; s++) {
             float sample_ac_v = 0.0f;
             float sample_dc_v = 0.0f;
 
@@ -649,7 +649,7 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
         }
 
         scan_trace_phase(DPMZM_SCAN_TRACE_PROCESS);
-        for (s = 0; s < DSP_GOERTZEL_BLOCK_SIZE; s++) {
+        for (s = 0; s < DPMZM_DSP_GOERTZEL_BLOCK_SIZE; s++) {
             if (req->dump_mode == DPMZM_SCAN_DUMP_RAW ||
                 req->dump_mode == DPMZM_SCAN_DUMP_BOTH) {
                 print_raw_line(req,
@@ -690,7 +690,7 @@ bool dpmzm_scan_measure_point(const dpmzm_scan_request_t *req,
     out->mag_fdiff = sum_fdiff / (float)req->blocks;
     out->mag_fsum = sum_fsum / (float)req->blocks;
     out->dc_mean = sum_dc / (float)req->blocks;
-    out->sample_count = req->blocks * DSP_GOERTZEL_BLOCK_SIZE;
+    out->sample_count = req->blocks * DPMZM_DSP_GOERTZEL_BLOCK_SIZE;
 
     scan_trace_phase(DPMZM_SCAN_TRACE_RESTORE);
     (void)apply_scan_biases(req, base_vi, base_vq, base_vp);

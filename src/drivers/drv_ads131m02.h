@@ -71,12 +71,12 @@
  * exactly 1 complete cycle in 64 consecutive samples, consistent with
  * fDATA = 64 kSPS (OSR=128, code=0x00), not 32 kSPS as previously assumed.
  */
-#define ADS131M02_CLK_OSR_128       0x0000  /* 64  kSPS @ 8.192 MHz, HR */
-#define ADS131M02_CLK_OSR_256       0x0001  /* 32  kSPS */
-#define ADS131M02_CLK_OSR_512       0x0002  /* 16  kSPS */
-#define ADS131M02_CLK_OSR_1024      0x0003  /*  8  kSPS */
-#define ADS131M02_CLK_OSR_2048      0x0004  /*  4  kSPS */
-#define ADS131M02_CLK_OSR_4096      0x0005  /*  2  kSPS */
+#define ADS131M02_CLK_OSR_128       0x0000  /* 32  kSPS @ 8.192 MHz, HR */
+#define ADS131M02_CLK_OSR_256       0x0001  /* 16  kSPS */
+#define ADS131M02_CLK_OSR_512       0x0002  /*  8  kSPS */
+#define ADS131M02_CLK_OSR_1024      0x0003  /*  4  kSPS */
+#define ADS131M02_CLK_OSR_2048      0x0004  /*  2  kSPS */
+#define ADS131M02_CLK_OSR_4096      0x0005  /*  1  kSPS */
 #define ADS131M02_CLK_PWR_HR        (0x03 << 4)  /* High-resolution mode */
 #define ADS131M02_CLK_PWR_LP        (0x02 << 4)  /* Low-power mode */
 #define ADS131M02_CLK_PWR_VLP       (0x01 << 4)  /* Very low-power mode */
@@ -108,7 +108,7 @@ typedef void (*ads131m02_drdy_cb_t)(const ads131m02_sample_t *sample);
  * Initialize the ADS131M02.
  * - Reset device
  * - Verify device ID
- * - Configure: both channels enabled, OSR=256 (32kSPS), gain=1, HR mode
+ * - Configure: both channels enabled, OSR=128 (32kSPS), gain=1, HR mode
  * - Enable CRC
  *
  * @return 0 on success, negative on error (e.g., ID mismatch)
